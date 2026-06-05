@@ -123,9 +123,9 @@ class SplashScreen(QWidget):
     def _tick(self):
         self._phase += 0.05
 
-        # Smooth progress interpolation
+        # Smooth progress interpolation — плавнее
         diff = self._target_progress - self._progress
-        self._progress += diff * 0.08
+        self._progress += diff * 0.05
 
         # Spawn particles along progress bar
         if self._progress > 0.01 and not self._finished:
@@ -144,7 +144,7 @@ class SplashScreen(QWidget):
 
         # Fade out
         if self._finished:
-            self._alpha = max(0, self._alpha - 6)
+            self._alpha = max(0, self._alpha - 3)  # плавнее исчезновение ~1.4сек
             if self._alpha <= 0:
                 self._anim_timer.stop()
                 self.hide()
@@ -183,8 +183,9 @@ class SplashScreen(QWidget):
         orb_y = 85 + math.cos(self._phase * 0.5) * 8
         orb_r = 60 + math.sin(self._phase) * 15
         orb_grad = QRadialGradient(orb_x, orb_y, orb_r)
-        orb_grad.setColorAt(0, QColor(140, 60, 220, 40))
-        orb_grad.setColorAt(0.5, QColor(100, 30, 180, 15))
+        orb_grad.setColorAt(0, QColor(120, 80, 230, 50))
+        orb_grad.setColorAt(0.4, QColor(60, 140, 220, 25))
+        orb_grad.setColorAt(0.7, QColor(100, 50, 200, 15))
         orb_grad.setColorAt(1, QColor(0, 0, 0, 0))
         painter.fillRect(QRectF(0, 0, w, h), orb_grad)
 
@@ -204,10 +205,12 @@ class SplashScreen(QWidget):
         line_y = 142
         line_grad = QLinearGradient(40, 0, w - 40, 0)
         line_grad.setColorAt(0, QColor(0, 0, 0, 0))
-        line_grad.setColorAt(0.3, QColor(140, 60, 220, 150))
+        line_grad.setColorAt(0.2, QColor(100, 50, 200, 140))
+        line_grad.setColorAt(0.4, QColor(140, 80, 230, 180))
         t = (math.sin(self._phase) + 1) / 2
-        line_grad.setColorAt(0.5, QColor(180, 100, 255, int(150 + t * 100)))
-        line_grad.setColorAt(0.7, QColor(140, 60, 220, 150))
+        line_grad.setColorAt(0.5, QColor(60, 170, 230, int(180 + t * 75)))
+        line_grad.setColorAt(0.6, QColor(140, 80, 230, 180))
+        line_grad.setColorAt(0.8, QColor(100, 50, 200, 140))
         line_grad.setColorAt(1, QColor(0, 0, 0, 0))
         painter.fillRect(QRectF(40, line_y, w - 80, 2), line_grad)
 
@@ -237,16 +240,17 @@ class SplashScreen(QWidget):
             fill_rect = QRectF(bar_x, bar_y, fill_w, bar_h)
 
             fill_grad = QLinearGradient(bar_x, 0, bar_x + fill_w, 0)
-            fill_grad.setColorAt(0, QColor(60, 20, 120))
-            fill_grad.setColorAt(0.5, QColor(120, 50, 200))
+            fill_grad.setColorAt(0, QColor(60, 20, 130))
+            fill_grad.setColorAt(0.3, QColor(80, 60, 200))
+            fill_grad.setColorAt(0.5, QColor(50, 140, 220))
             # Shimmer effect
             shimmer = (math.sin(self._phase * 2) + 1) / 2
             fill_grad.setColorAt(0.7, QColor(
-                int(140 + shimmer * 40),
-                int(60 + shimmer * 30),
-                int(220 + shimmer * 35)
+                int(60 + shimmer * 40),
+                int(160 + shimmer * 30),
+                int(230 + shimmer * 25)
             ))
-            fill_grad.setColorAt(1, QColor(160, 80, 240))
+            fill_grad.setColorAt(1, QColor(100, 200, 240))
 
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(fill_grad)
@@ -255,7 +259,7 @@ class SplashScreen(QWidget):
             # Glow on leading edge
             edge_x = bar_x + fill_w
             edge_glow = QRadialGradient(edge_x, bar_y + bar_h / 2, 20)
-            edge_glow.setColorAt(0, QColor(180, 100, 255, 100))
+            edge_glow.setColorAt(0, QColor(80, 160, 240, 120))
             edge_glow.setColorAt(1, QColor(0, 0, 0, 0))
             painter.fillRect(QRectF(edge_x - 20, bar_y - 10, 40, bar_h + 20), edge_glow)
 
@@ -269,9 +273,9 @@ class SplashScreen(QWidget):
         # ─── Particles ───
         for p in self._particles:
             alpha = int(p.life * 200)
-            color = QColor(160, 90, 240, alpha)
+            color = QColor(140, 120, 240, alpha) if random.random() > 0.4 else QColor(60, 170, 230, alpha)
             glow = QRadialGradient(p.x, p.y, p.size * 2.5)
-            glow.setColorAt(0, QColor(200, 140, 255, alpha))
+            glow.setColorAt(0, QColor(120, 180, 255, alpha))
             glow.setColorAt(0.5, color)
             glow.setColorAt(1, QColor(0, 0, 0, 0))
             painter.setBrush(glow)
@@ -284,9 +288,9 @@ class SplashScreen(QWidget):
         # ─── Border ───
         painter.setClipping(False)
         border_grad = QLinearGradient(0, 0, w, h)
-        border_grad.setColorAt(0, QColor(100, 40, 180, 60))
-        border_grad.setColorAt(0.5, QColor(140, 60, 220, 40))
-        border_grad.setColorAt(1, QColor(80, 30, 150, 60))
+        border_grad.setColorAt(0, QColor(100, 50, 200, 70))
+        border_grad.setColorAt(0.5, QColor(60, 160, 230, 50))
+        border_grad.setColorAt(1, QColor(100, 50, 200, 70))
         painter.setPen(QPen(border_grad, 1.5))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), 16, 16)

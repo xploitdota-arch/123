@@ -3,19 +3,23 @@ import os
 import json
 import shutil
 import subprocess
+import base64
+import zlib
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QCheckBox, QPushButton, QTextEdit, QLabel,
-    QLineEdit, QFrame, QGraphicsDropShadowEffect, QProgressBar,
-    QStackedWidget, QListWidget, QListWidgetItem, QMessageBox
+    QLineEdit, QFrame, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QProgressBar,
+    QStackedWidget, QListWidget, QListWidgetItem, QMessageBox, QSlider, QFileDialog
 )
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRectF
+from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, QRectF, QRect
+from PyQt6.QtCore import QObject
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QPixmap, QPainter, QColor, QCursor, QMovie,
     QPen, QPainterPath, QLinearGradient, QRadialGradient, QRegion, QIcon
 )
+from PyQt6.QtWidgets import QColorDialog
 import random
 import math
 
@@ -41,7 +45,7 @@ else:
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
         return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    return {"java_path": "", "window_width": 1000, "window_height": 600, "ram": "2G", "low_perf": False, "mc_perf": True}
+    return {"java_path": "", "window_width": 1000, "window_height": 600, "ram": "2G", "low_perf": False, "mc_perf": True, "theme_primary": "#8040c8", "theme_secondary": "#40a8e8", "custom_bg": ""}
 
 
 def save_settings(data: dict):
@@ -143,6 +147,7 @@ class InstallThread(QThread):
     log_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal()
+    launched_signal = pyqtSignal(object)  # subprocess.Popen — процесс Minecraft
     error_signal = pyqtSignal(str)
 
     def __init__(self, version: str, username: str, mc_dir: Path, settings: dict, parent=None):
@@ -243,7 +248,8 @@ class InstallThread(QThread):
             self.log_signal.emit(f"☕ Java в команде: {Path(cmd[0]).name}")
             self.log_signal.emit(f"🚀 Полная команда (первые 12 аргументов): {' '.join(cmd[:12])} ...")
             self.log_signal.emit("🚀 Запуск Minecraft...")
-            subprocess.Popen(cmd, cwd=str(self.mc_dir), **NO_WINDOW_KWARGS)
+            mc_process = subprocess.Popen(cmd, cwd=str(self.mc_dir), **NO_WINDOW_KWARGS)
+            self.launched_signal.emit(mc_process)
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -458,7 +464,7 @@ class ModInstallThread(QThread):
 
     def __init__(self, mod_type: str, mc_version: str, mc_dir: Path, parent=None):
         super().__init__(parent)
-        self.mod_type = mod_type  # "forge" or "fabric"
+        self.mod_type = mod_type  # "forge", "fabric" or "forgeoptifine"
         self.mc_version = mc_version
         self.mc_dir = mc_dir
         self._max = 100
@@ -476,8 +482,6 @@ class ModInstallThread(QThread):
             callback = {"setStatus": set_status, "setMax": set_max, "setProgress": set_progress}
 
             # Определяем требуемую Java для mc_version (из удалённого json vanilla, до установки)
-            # Это нужно, чтобы процессоры Forge/Fabric (в mll.install) запускались с правильной Java
-            # и не было проблем с class file version 69.0 при установке/запуске
             required_java = 21
             try:
                 from launcher.api import get_version_info as get_vi
@@ -495,7 +499,161 @@ class ModInstallThread(QThread):
                 java_path = "java"
             self.log_signal.emit(f"☕ Для установки {self.mod_type} используется Java {required_java}")
 
-            if self.mod_type == "forge":
+            if self.mod_type == "forgeoptifine":
+                # ─── OptiFine: сначала ванилла, потом OptiFine ───
+                self.log_signal.emit(f"📦 Установка ваниллы {self.mc_version}...")
+                mll.install.install_minecraft_version(self.mc_version, str(self.mc_dir), callback=callback)
+                installed_id = self.mc_version
+                self.log_signal.emit(f"✅ Ванилла установлена")
+
+                if self.mod_type == "forgeoptifine":
+                    # ─── ForgeOptiFine: скачиваем OptiFine через зеркала ───
+                    import urllib.request
+                    import json as _json
+
+                    OF_DL_MIRRORS = [
+                        "https://of-302v.zkitefly.eu.org/file/",
+                        "https://of-302.zkitefly.eu.org/file/",
+                        "https://of-302.burningtnt.workers.dev/file/",
+                    ]
+                    OF_VERSIONS_APIS = [
+                        "https://bmclapi2.bangbang93.com/optifine/",
+                    ]
+                    OF_DL_API = "https://optifine-dl-link.vercel.app/api"
+
+                    self.log_signal.emit(f"🔮 Поиск OptiFine для {self.mc_version}...")
+                    of_filename = None
+
+                    # Шаг 1: попробовать найти версию через API зеркал
+                    for api_base in OF_VERSIONS_APIS:
+                        try:
+                            api_url = api_base + self.mc_version
+                            self.log_signal.emit(f"📡 Запрос {api_base.split('//')[1].split('/')[0]}...")
+                            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                            resp = urllib.request.urlopen(req, timeout=10)
+                            versions_list = _json.loads(resp.read())
+                            self.log_signal.emit(f"📋 Найдено {len(versions_list)} версий OptiFine")
+                            for v in versions_list:
+                                if not v.get("filename", "").startswith("preview_"):
+                                    of_filename = v["filename"]
+                                    break
+                            if not of_filename and versions_list:
+                                of_filename = versions_list[0]["filename"]
+                            if of_filename:
+                                break
+                        except Exception as e:
+                            self.log_signal.emit(f"⚠️ {api_base.split('//')[1].split('/')[0]}: {e}")
+
+                    # Шаг 2: фоллбэк — Vercel API (нужен патч, пробуем общие)
+                    if not of_filename:
+                        self.log_signal.emit("📡 Пробуем альтернативный API...")
+                        common_patches = ["I7", "I6", "I5", "J9", "J7", "J6", "J4", "J3", "J2", "J1"]
+                        for patch in common_patches:
+                            try:
+                                vurl = f"{OF_DL_API}?mc={self.mc_version}&of={patch}"
+                                vreq = urllib.request.Request(vurl, headers={"User-Agent": "Mozilla/5.0"})
+                                vresp = urllib.request.urlopen(vreq, timeout=10)
+                                vdata = _json.loads(vresp.read())
+                                if vdata.get("status") and vdata.get("url"):
+                                    of_filename = f"OptiFine_{self.mc_version}_HD_U_{patch}.jar"
+                                    # Сразу сохраняем прямую ссылку
+                                    self._of_direct_url = vdata["url"]
+                                    self.log_signal.emit(f"📦 OptiFine: {of_filename} (Vercel)")
+                                    break
+                            except Exception:
+                                continue
+
+                    if not of_filename:
+                        self.log_signal.emit(f"⚠️ OptiFine не найден для {self.mc_version}")
+                        self.log_signal.emit("📥 Возможно версии ещё нет — попробуй позже или скачай вручную с optifine.net")
+                    else:
+                        if not getattr(self, '_of_direct_url', None):
+                            self._of_direct_url = None
+                        self.log_signal.emit(f"📦 OptiFine: {of_filename}")
+
+                        # Шаг 3: скачать JAR
+                        self.log_signal.emit("⬇️ Скачивание OptiFine...")
+                        of_jar = self.mc_dir / "optifine_installer.jar"
+                        downloaded = False
+
+                        # Если есть прямая ссылка от Vercel — пробуем сначала
+                        if self._of_direct_url:
+                            try:
+                                self.log_signal.emit("📡 Скачивание (Vercel)...")
+                                req = urllib.request.Request(self._of_direct_url, headers={"User-Agent": "Mozilla/5.0"})
+                                resp = urllib.request.urlopen(req, timeout=120)
+                                with open(of_jar, "wb") as f:
+                                    while True:
+                                        chunk = resp.read(65536)
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                                size_kb = of_jar.stat().st_size // 1024
+                                self.log_signal.emit(f"✅ Скачано ({size_kb} КБ)")
+                                downloaded = True
+                            except Exception as e:
+                                self.log_signal.emit(f"⚠️ Vercel: {e}")
+
+                        # Зеркала zkitefly
+                        if not downloaded:
+                            for mirror in OF_DL_MIRRORS:
+                                try:
+                                    dl_url = mirror + of_filename
+                                    host = mirror.split("//")[1].split("/")[0]
+                                    self.log_signal.emit(f"📡 {host}...")
+                                    req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+                                    resp = urllib.request.urlopen(req, timeout=120)
+                                    with open(of_jar, "wb") as f:
+                                        while True:
+                                            chunk = resp.read(65536)
+                                            if not chunk:
+                                                break
+                                            f.write(chunk)
+                                    size_kb = of_jar.stat().st_size // 1024
+                                    self.log_signal.emit(f"✅ Скачано ({size_kb} КБ)")
+                                    downloaded = True
+                                    break
+                                except Exception as e:
+                                    self.log_signal.emit(f"⚠️ {host}: {e}")
+
+                        if not downloaded:
+                            self.log_signal.emit("⚠️ Не удалось скачать OptiFine — установлен только Forge")
+                        else:
+                            # Шаг 4: установить OptiFine
+                            self.log_signal.emit("🔧 Установка OptiFine...")
+                            import subprocess
+                            cmd = [str(java_path), "-jar", str(of_jar), "--install", str(self.mc_dir)]
+                            self.log_signal.emit(f"🔧 {' '.join(cmd)}")
+                            try:
+                                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                                if result.stdout.strip():
+                                    self.log_signal.emit(f"🔧 {result.stdout.strip()[:300]}")
+                                if result.returncode != 0 and result.stderr.strip():
+                                    self.log_signal.emit(f"⚠️ {result.stderr.strip()[:200]}")
+                            except subprocess.TimeoutExpired:
+                                self.log_signal.emit("⚠️ OptiFine installer — таймаут")
+                            except Exception as e:
+                                self.log_signal.emit(f"⚠️ OptiFine installer: {e}")
+                            try:
+                                of_jar.unlink()
+                            except Exception:
+                                pass
+                            # Определяем ID профиля ForgeOptiFine
+                            versions_dir = self.mc_dir / "versions"
+                            of_profile = None
+                            if versions_dir.exists():
+                                for d in versions_dir.iterdir():
+                                    if d.is_dir() and "optifine" in d.name.lower():
+                                        of_profile = d.name
+                                        break
+                            if of_profile:
+                                installed_id = of_profile
+                                self.log_signal.emit(f"✅ OptiFine: {of_profile}")
+                            else:
+                                self.log_signal.emit("✅ OptiFine установлен")
+
+            elif self.mod_type == "forge":
+                # ─── Forge ───
                 self.log_signal.emit(f"🔨 Установка Forge для {self.mc_version}...")
                 forge_ver = mll.forge.find_forge_version(self.mc_version)
                 if not forge_ver:
@@ -504,7 +662,9 @@ class ModInstallThread(QThread):
                 self.log_signal.emit(f"📦 Forge: {forge_ver}")
                 mll.forge.install_forge_version(forge_ver, str(self.mc_dir), callback=callback, java=java_path)
                 installed_id = forge_ver
+
             else:
+                # ─── Fabric ───
                 self.log_signal.emit(f"🧵 Установка Fabric для {self.mc_version}...")
                 if not mll.fabric.is_minecraft_version_supported(self.mc_version):
                     self.error_signal.emit(f"Fabric не поддерживает {self.mc_version}")
@@ -513,9 +673,10 @@ class ModInstallThread(QThread):
                 loader = mll.fabric.get_latest_loader_version()
                 installed_id = f"fabric-loader-{loader}-{self.mc_version}"
 
-            self.log_signal.emit(f"✅ {self.mod_type.capitalize()} установлен!")
+            type_name = {"vanilla": "Vanilla", "forge": "Forge", "forgeoptifine": "OptiFine", "fabric": "Fabric"}.get(self.mod_type, self.mod_type)
+            self.log_signal.emit(f"✅ {type_name} установлен!")
 
-            # Ванильные файлы оставляем (нужны для inheritsFrom в Forge/Fabric).
+            # Ванильные файлы оставляем (нужны для inheritsFor в Forge/Fabric).
             # Список скрывает ваниль благодаря фильтру в get_installed_versions_list.
 
             self.finished_signal.emit(installed_id)
@@ -554,7 +715,7 @@ class RoundedMenu(QFrame):
         v.setContentsMargins(6, 6, 6, 6)
         v.setSpacing(2)
 
-        for idx, label in [(1, "⚡ Менеджер версий"), (3, "🧩 Моды"), (2, "⚙ Настройки лаунчера")]:
+        for idx, label in [(1, "Менеджер версий"), (3, "Моды"), (4, "Тема"), (2, "Настройки")]:
             btn = QPushButton(label)
             btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             btn.clicked.connect(lambda checked, i=idx: self.page_selected.emit(i))
@@ -681,8 +842,11 @@ class Particle:
         self.life = random.uniform(0.6, 1.0)
         self.decay = random.uniform(0.015, 0.035)
         self.size = random.uniform(2, 5)
-        # Purple-ish colors
-        self.hue = random.randint(250, 290)
+        # Purple to cyan colors
+        self.hue = random.choice([
+            random.randint(250, 290),  # purple
+            random.randint(180, 210),  # cyan
+        ])
         self.brightness = random.randint(160, 255)
 
     def update(self):
@@ -708,7 +872,7 @@ class ParticleOverlay(QWidget):
         self._active = False
 
         self._timer = QTimer(self)
-        self._timer.setInterval(33)  # ~30fps для снижения нагрузки на ПК
+        self._timer.setInterval(16)  # ~60fps — плавные частицы
         self._timer.timeout.connect(self._tick)
 
     def start(self, source_rect):
@@ -769,13 +933,90 @@ class ParticleOverlay(QWidget):
 
             # Glow
             grad = QRadialGradient(p.x, p.y, p.size * 3)
-            grad.setColorAt(0, QColor(val, 100, 255, alpha))
+            grad.setColorAt(0, QColor(100, min(255, val + 50), 255, alpha))
             grad.setColorAt(0.4, color)
             grad.setColorAt(1, QColor(hue % 256, 0, val // 2, 0))
 
             painter.setBrush(grad)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QRectF(p.x - p.size, p.y - p.size, p.size * 2, p.size * 2))
+
+        painter.end()
+
+
+# ─── Gradient Spinner ───
+
+class GradientSpinner(QWidget):
+    """Animated spinner with purple→cyan gradient and comet tail."""
+
+    def __init__(self, size=52, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+        self._angle = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)  # ~60fps — плавное вращение
+        self._timer.timeout.connect(self._tick)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def start(self):
+        self._timer.start()
+        self.show()
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 3.5) % 360  # плавнее вращение
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        pen_w = 3.5
+        margin = pen_w + 2
+        rect = QRectF(margin, margin, w - 2 * margin, h - 2 * margin)
+
+        # Background track
+        track_pen = QPen(QColor(40, 20, 70, 50), pen_w,
+                         Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(track_pen)
+        painter.drawArc(rect, 0, 360 * 16)
+
+        # Gradient arc with comet-tail fade
+        segments = 18
+        arc_deg = 300
+        seg_deg = arc_deg / segments
+
+        for i in range(segments):
+            t = i / segments
+            alpha = int(255 * (1.0 - t * t))
+            r = int(80 + 100 * t)
+            g = int(200 - 120 * t)
+            b = int(240 - 10 * t)
+            start = self._angle + i * seg_deg
+            pen = QPen(QColor(r, g, b, alpha), pen_w,
+                       Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawArc(rect, int(start * 16), int(seg_deg * 16 + 10))
+
+        # Glow at head
+        head_rad = math.radians(self._angle)
+        cx = rect.center().x() + rect.width() / 2 * math.cos(head_rad)
+        cy = rect.center().y() - rect.height() / 2 * math.sin(head_rad)
+        glow_r = pen_w * 4
+        glow = QRadialGradient(cx, cy, glow_r)
+        glow.setColorAt(0, QColor(60, 210, 250, 170))
+        glow.setColorAt(0.4, QColor(120, 80, 230, 80))
+        glow.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(glow)
+        painter.drawEllipse(QRectF(cx - glow_r, cy - glow_r, glow_r * 2, glow_r * 2))
 
         painter.end()
 
@@ -794,11 +1035,11 @@ class AnimatedLaunchBtn(QPushButton):
         self._spinner_idx = 0
         self._glow_phase = 0.0
         self._pulse_timer = QTimer(self)
-        self._pulse_timer.setInterval(100)  # медленнее для снижения нагрузки
+        self._pulse_timer.setInterval(40)  # ~25fps — плавная пульсация
         self._pulse_timer.timeout.connect(self._pulse_tick)
 
         self._spinner_timer = QTimer(self)
-        self._spinner_timer.setInterval(150)
+        self._spinner_timer.setInterval(100)  # плавнее спиннер
         self._spinner_timer.timeout.connect(self._spinner_tick)
 
         self._glow_effect = None
@@ -820,21 +1061,21 @@ class AnimatedLaunchBtn(QPushButton):
         self._spinner_timer.stop()
         self.setText(text)
         if self._glow_effect:
-            self._glow_effect.setColor(QColor(120, 40, 200, 180))
+            self._glow_effect.setColor(QColor(100, 80, 220, 180))
             self._glow_effect.setBlurRadius(28)
 
     def _pulse_tick(self):
-        self._glow_phase += 0.12
+        self._glow_phase += 0.045  # медленнее = плавнее свечение
         if self._glow_effect:
             # Pulsating glow: blur radius oscillates 10..25 (снижено для оптимизации)
             t = (math.sin(self._glow_phase) + 1) / 2  # 0..1
             blur = 10 + t * 15
             alpha = int(80 + t * 80)
-            # Shift hue slightly for shimmer
-            hue_shift = int(math.sin(self._glow_phase * 0.7) * 20)
-            r = max(0, min(255, 120 + hue_shift))
-            g = max(0, min(255, 40))
-            b = max(0, min(255, 220 - hue_shift))
+            # Shift hue: purple ↔ cyan shimmer
+            hue_shift = int(math.sin(self._glow_phase * 0.7) * 30)
+            r = max(0, min(255, 100 + hue_shift))
+            g = max(0, min(255, 60 + int(math.sin(self._glow_phase * 0.4) * 40)))
+            b = max(0, min(255, 230))
             self._glow_effect.setColor(QColor(r, g, b, alpha))
             self._glow_effect.setBlurRadius(blur)
 
@@ -857,9 +1098,11 @@ class GlowSeparator(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         grad = QLinearGradient(0, 0, self.width(), 0)
         grad.setColorAt(0.0, QColor(0, 0, 0, 0))
-        grad.setColorAt(0.3, QColor(140, 60, 220, 200))
-        grad.setColorAt(0.5, QColor(180, 100, 255, 255))
-        grad.setColorAt(0.7, QColor(140, 60, 220, 200))
+        grad.setColorAt(0.2, QColor(100, 50, 200, 180))
+        grad.setColorAt(0.35, QColor(160, 80, 240, 230))
+        grad.setColorAt(0.5, QColor(60, 170, 230, 255))
+        grad.setColorAt(0.65, QColor(160, 80, 240, 230))
+        grad.setColorAt(0.8, QColor(100, 50, 200, 180))
         grad.setColorAt(1.0, QColor(0, 0, 0, 0))
         painter.fillRect(self.rect(), grad)
         painter.end()
@@ -867,47 +1110,64 @@ class GlowSeparator(QFrame):
 
 # ─── Stylesheet ───
 
-def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
+def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI",
+               primary: str = "#8040c8", secondary: str = "#40a8e8") -> str:
+    # Parse hex → r,g,b
+    pr, pg, pb = int(primary[1:3],16), int(primary[3:5],16), int(primary[5:7],16)
+    sr, sg, sb = int(secondary[1:3],16), int(secondary[3:5],16), int(secondary[5:7],16)
+    # Dark panel bg derived from primary
+    pdr = min(255, pr // 4); pdg = min(255, pg // 4); pdb = min(255, pb // 4)
+    # Border colors
+    bra = f"rgba({pr},{pg},{pb},90)"; brb = f"rgba({sr},{sg},{sb},130)"
+    # Button gradient
+    b1 = primary; b2 = secondary
     return f"""
     QWidget{{color:#e0d0f0;font-family:"Segoe UI";font-size:13px;}}
     #LeftPanel{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 rgba(18,8,30,250),
-            stop:0.5 rgba(12,5,22,252),
-            stop:1 rgba(18,8,30,250));
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 rgba({pdr+4},{pdg+2},{pdb+8},190),
+            stop:1 rgba({pdr},{pdg},{pdb},190));
         border:none;
-        border-right:1px solid rgba(120,50,180,40);
+        border-right:2px solid qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 {bra},stop:0.5 {brb},stop:1 {bra});
     }}
     #RightPanel{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 rgba(18,8,30,250),
-            stop:1 rgba(12,5,22,252));
+        background-color:qlineargradient(x1:1,y1:0,x2:0,y2:1,
+            stop:0 rgba({pdr+4},{pdg+2},{pdb+8},190),
+            stop:1 rgba({pdr},{pdg},{pdb},190));
         border:none;
-        border-left:1px solid rgba(120,50,180,40);
+        border-left:2px solid qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 {bra},stop:0.5 {brb},stop:1 {bra});
     }}
     #CenterBg{{
         background-color:#08040e;
     }}
     #TopBar{{
-        background-color:rgba(12,5,20,252);
-        border-bottom:1px solid rgba(140,60,220,60);
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 rgba({pdr+8},{pdg+4},{pdb+10},200),
+            stop:0.5 rgba({pdr+2},{pdg},{pdb+4},200),
+            stop:1 rgba({pdr+8},{pdg+4},{pdb+10},200));
+        border-bottom:1px solid qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 rgba({pr},{pg},{pb},50),
+            stop:0.5 rgba({sr},{sg},{sb},100),
+            stop:1 rgba({pr},{pg},{pb},50));
     }}
 
     QLineEdit{{
-        background-color:rgba(25,12,40,200);
-        border:1px solid rgba(120,50,180,100);
+        background-color:rgba({pdr+10},{pdg+5},{pdb+15},200);
+        border:1px solid rgba({pr},{pg},{pb},100);
         border-radius:8px;
         padding:8px 12px;
         color:#e0d0f0;
         font-size:13px;
-        selection-background-color:#5a2090;
+        selection-background-color:{primary};
     }}
-    QLineEdit:focus{{border:1px solid #9050e0;}}
+    QLineEdit:focus{{border:1px solid {primary};}}
     QLineEdit::placeholder{{color:rgba(160,130,200,120);}}
 
     QComboBox{{
-        background-color:rgba(25,12,40,200);
-        border:1px solid rgba(120,50,180,100);
+        background-color:rgba({pdr+10},{pdg+5},{pdb+15},200);
+        border:1px solid rgba({pr},{pg},{pb},100);
         border-radius:8px;
         padding:8px 12px;
         padding-right:28px;
@@ -919,13 +1179,13 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         image:none;
         border-left:5px solid transparent;
         border-right:5px solid transparent;
-        border-top:7px solid #8040c0;
+        border-top:7px solid {primary};
         width:0;height:0;margin-top:2px;
     }}
     QComboBox QAbstractItemView{{
-        background:#140822;
-        border:1px solid #4a2060;
-        selection-background-color:#3a1555;
+        background:rgba({pdr},{pdg},{pdb},240);
+        border:1px solid rgba({pr},{pg},{pb},120);
+        selection-background-color:rgba({pr},{pg},{pb},80);
         color:#e0d0f0;
         padding:4px;
         border-radius:6px;
@@ -934,18 +1194,18 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
     QCheckBox{{spacing:8px;color:#a090c0;font-size:12px;}}
     QCheckBox::indicator{{
         width:18px;height:18px;border-radius:4px;
-        border:1px solid #6030a0;
-        background:rgba(20,10,35,200);
+        border:1px solid rgba({pr},{pg},{pb},150);
+        background:rgba({pdr+8},{pdg+4},{pdb+12},200);
     }}
-    QCheckBox::indicator:hover{{border:1px solid #9050e0;}}
+    QCheckBox::indicator:hover{{border:1px solid {primary};}}
     QCheckBox::indicator:checked{{
-        background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #7030b0,stop:1 #a050e0);
-        border:1px solid #b070ff;
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {primary},stop:1 {secondary});
+        border:1px solid {primary};
     }}
 
     QProgressBar{{
-        background-color:rgba(20,10,35,200);
-        border:1px solid rgba(120,50,180,80);
+        background-color:rgba({pdr+8},{pdg+4},{pdb+12},200);
+        border:1px solid rgba({pr},{pg},{pb},80);
         border-radius:6px;
         color:#e0d0f0;
         text-align:center;
@@ -954,15 +1214,15 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
     }}
     QProgressBar::chunk{{
         background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,
-            stop:0 #4a1580,stop:0.5 #8040d0,stop:1 #b060ff);
+            stop:0 {primary},stop:0.5 rgba({(pr+sr)//2},{(pg+sg)//2},{(pb+sb)//2},255),stop:1 {secondary});
         border-radius:5px;
     }}
 
     #LaunchBtn{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #6020a0,stop:0.5 #4a1580,stop:1 #30105a);
-        border:1px solid #7030b0;
-        border-radius:10px;
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 {primary},stop:0.5 rgba({(pr+sr)//2},{(pg+sg)//2},{(pb+sb)//2},255),stop:1 {secondary});
+        border:1px solid rgba({pr},{pg},{pb},180);
+        border-radius:12px;
         padding:14px;
         font-family:"{mc_font}";
         font-size:16px;
@@ -971,30 +1231,31 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         margin:6px 0;
     }}
     #LaunchBtn:hover{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #7830c0,stop:0.5 #5a20a0,stop:1 #3a1570);
-        border:1px solid #a050e0;
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 rgba({min(255,pr+30)},{min(255,pg+20)},{min(255,pb+20)},255),
+            stop:1 rgba({min(255,sr+30)},{min(255,sg+20)},{min(255,sb+20)},255));
+        border:1px solid rgba({min(255,pr+40)},{min(255,pg+30)},{min(255,pb+30)},255);
     }}
     #LaunchBtn:pressed{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #2a0845,stop:1 #4a1580);
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 rgba({pdr},{pdg},{pdb},255),stop:1 rgba({pdr+20},{pdg+10},{pdb+20},255));
         padding-top:15px;padding-bottom:13px;
     }}
     #LaunchBtn:disabled{{
-        background-color:rgba(30,15,50,200);
-        color:#6050a0;
-        border:1px solid #3a2060;
+        background-color:rgba({pdr},{pdg},{pdb},200);
+        color:rgba({pr},{pg},{pb},120);
+        border:1px solid rgba({pr},{pg},{pb},50);
     }}
 
     QTextEdit#Log{{
-        background-color:rgba(12,6,22,220);
-        border:1px solid rgba(100,40,160,50);
+        background-color:rgba({pdr},{pdg},{pdb},220);
+        border:1px solid rgba({pr},{pg},{pb},50);
         border-radius:8px;
         color:#c0a0e0;
         font-family:Consolas,"Courier New",monospace;
         font-size:11px;
         padding:8px;
-        selection-background-color:#4a2070;
+        selection-background-color:rgba({pr},{pg},{pb},80);
     }}
 
     #WinBtn{{
@@ -1002,38 +1263,38 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         color:#8070a0;font-size:16px;
         padding:2px 10px;border-radius:6px;
     }}
-    #WinBtn:hover{{background-color:rgba(120,50,180,40);color:#e0d0f0;}}
+    #WinBtn:hover{{background-color:rgba({pr},{pg},{pb},40);color:#e0d0f0;}}
 
     #CloseBtn{{
         background:transparent;border:none;
         color:#8070a0;font-size:16px;
         padding:2px 10px;border-radius:6px;
     }}
-    #CloseBtn:hover{{background-color:#8020c0;color:#fff;}}
+    #CloseBtn:hover{{background-color:{primary};color:#fff;}}
 
     QListWidget{{
-        background-color:rgba(18,8,30,220);
-        border:1px solid rgba(120,50,180,60);
+        background-color:rgba({pdr+4},{pdg+2},{pdb+6},220);
+        border:1px solid rgba({pr},{pg},{pb},60);
         border-radius:8px;
         color:#e0d0f0;
         outline:none;
     }}
     QListWidget::item{{
         padding:8px 12px;
-        border-bottom:1px solid rgba(120,50,180,20);
+        border-bottom:1px solid rgba({pr},{pg},{pb},20);
     }}
     QListWidget::item:selected{{
         background-color:qlineargradient(x1:0,y1:0,x2:1,y2:0,
-            stop:0 #3a1560,stop:1 #2a1040);
+            stop:0 rgba({pr},{pg},{pb},60),stop:1 rgba({sr},{sg},{sb},40));
         color:#fff;
         border-radius:6px;
     }}
-    QListWidget::item:hover{{background-color:rgba(80,30,130,40);}}
+    QListWidget::item:hover{{background-color:rgba({pr},{pg},{pb},30);}}
 
     #ActBtn{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #3a1560,stop:1 #200a38);
-        border:1px solid #5a2080;
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 rgba({pdr+10},{pdg+5},{pdb+15},255),stop:1 rgba({pdr},{pdg},{pdb},255));
+        border:1px solid rgba({pr},{pg},{pb},120);
         border-radius:8px;
         padding:9px 18px;
         color:#d0c0e0;
@@ -1041,15 +1302,15 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         font-size:13px;
     }}
     #ActBtn:checked{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #6020a0,stop:1 #4a1580);
-        border:1px solid #9050e0;
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 {primary},stop:1 {secondary});
+        border:1px solid {primary};
         color:#fff;
     }}
     #ActBtn:hover{{
-        background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1,
-            stop:0 #5a2090,stop:1 #3a1060);
-        border:1px solid #8040c0;
+        background-color:qlineargradient(x1:0,y1:0,x2:1,y2:1,
+            stop:0 rgba({pr},{pg},{pb},80),stop:1 rgba({sr},{sg},{sb},60));
+        border:1px solid rgba({min(255,pr+30)},{min(255,pg+20)},{min(255,pb+20)},200);
         color:#fff;
     }}
 
@@ -1057,13 +1318,13 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         font-family:"{mc_font}";
         font-size:20px;
         font-weight:bold;
-        color:#b070ff;
+        color:{primary};
         padding-bottom:8px;
     }}
     #McLabel{{
         font-family:"{mc_font}";
         font-size:12px;
-        color:#9080b0;
+        color:rgba({(pr+sr)//2},{(pg+sg)//2},{(pb+sb)//2},180);
     }}
     #TitleBarLabel{{
         font-family:"{title_font}";
@@ -1073,47 +1334,379 @@ def stylesheet(mc_font: str = "Segoe UI", title_font: str = "Segoe UI") -> str:
         letter-spacing:4px;
     }}
     #VersionLabel{{
-        color:#8070a0;
+        color:rgba({pr},{pg},{pb},120);
         font-size:11px;
     }}
     #ConsoleLabel{{
-        color:#7060a0;
+        color:rgba({pr},{pg},{pb},100);
         font-size:11px;
         font-family:"{mc_font}";
     }}
 
+    QSlider::groove:horizontal{{
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 rgba({pdr+8},{pdg+4},{pdb+12},220),stop:1 rgba({pdr},{pdg},{pdb},200));
+        height:8px;
+        border-radius:4px;
+        border:1px solid rgba({pr},{pg},{pb},80);
+    }}
+    QSlider::handle:horizontal{{
+        background:qlineargradient(x1:0,y1:0,x2:0,y2:1,
+            stop:0 {primary},stop:1 rgba({max(0,pr-40)},{max(0,pg-20)},{max(0,pb-20)},255));
+        border:2px solid rgba({min(255,pr+40)},{min(255,pg+30)},{min(255,pb+30)},255);
+        width:20px;
+        height:20px;
+        margin:-7px 0;
+        border-radius:10px;
+    }}
+    QSlider::handle:horizontal:hover{{
+        background:{primary};
+        border:2px solid rgba({min(255,pr+60)},{min(255,pg+50)},{min(255,pb+50)},255);
+    }}
+    QSlider::sub-page:horizontal{{
+        background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+            stop:0 {primary},stop:0.5 rgba({(pr+sr)//2},{(pg+sg)//2},{(pb+sb)//2},255),stop:1 {secondary});
+        border-radius:4px;
+    }}
+    QSlider::tick-mark:horizontal{{
+        background:rgba({pr},{pg},{pb},60);
+        height:4px;
+        width:1px;
+    }}
+
     QScrollBar:vertical{{
-        background:rgba(15,8,25,150);
+        background:rgba({pdr},{pdg},{pdb},150);
         width:8px;
         border-radius:4px;
         margin:2px;
     }}
     QScrollBar::handle:vertical{{
-        background:rgba(120,60,180,120);
+        background:rgba({pr},{pg},{pb},120);
         border-radius:4px;
         min-height:30px;
     }}
-    QScrollBar::handle:vertical:hover{{background:rgba(150,80,220,180);}}
+    QScrollBar::handle:vertical:hover{{background:rgba({pr},{pg},{pb},180);}}
     QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
     QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{{background:none;}}
     """
+
+
+# ─── Launch Overlay (full-screen progress on GIF) ───
+
+class LaunchOverlay(QWidget):
+    """Overlay on GIF area: shows launch progress, version name, spinner."""
+
+    mc_closed_signal = pyqtSignal()  # Minecraft process exited
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.hide()
+
+        self._progress = 0.0       # 0..1
+        self._target = 0.0
+        self._phase = 0.0
+        self._status = ""
+        self._version = ""
+        self._alpha = 0.0
+        self._active = False
+        self._particles: list[Particle] = []
+        self._waiting_mode = False  # "Закройте Minecraft" screen
+        self._mc_process = None     # subprocess.Popen
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+        # Таймер проверки процесса Minecraft
+        self._mc_check_timer = QTimer(self)
+        self._mc_check_timer.setInterval(1500)
+        self._mc_check_timer.timeout.connect(self._check_mc_process)
+
+    def start(self, version: str):
+        self._version = version
+        self._status = "Подготовка..."
+        self._progress = 0.0
+        self._target = 0.0
+        self._phase = 0.0
+        self._alpha = 0.0
+        self._active = True
+        self._particles.clear()
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def stop(self):
+        self._active = False
+
+    def start_waiting(self, mc_process):
+        """Переход в режим ожидания закрытия Minecraft."""
+        self._waiting_mode = True
+        self._mc_process = mc_process
+        self._status = "Закройте Minecraft чтобы вернуться"
+        self._target = 1.0
+        self._progress = 1.0
+        self._particles.clear()
+        self._mc_check_timer.start()
+
+    def _check_mc_process(self):
+        """Проверяет, закрыт ли Minecraft."""
+        if self._mc_process is not None:
+            ret = self._mc_process.poll()
+            if ret is not None:
+                # Minecraft закрыт
+                self._mc_check_timer.stop()
+                self._mc_process = None
+                self._waiting_mode = False
+                self.mc_closed_signal.emit()
+
+    def set_status(self, text: str):
+        self._status = text
+
+    def set_progress(self, cur: int, tot: int):
+        if tot > 0:
+            self._target = cur / tot
+
+    def _tick(self):
+        self._phase += 0.03
+
+        # Keep overlay sized to parent (fixes stretching during animations)
+        parent = self.parentWidget()
+        if parent:
+            self.setGeometry(parent.rect())
+
+        # Fade in — плавнее
+        if self._active and self._alpha < 1.0:
+            self._alpha = min(1.0, self._alpha + 0.035)
+
+        # Smooth progress — плавнее интерполяция
+        diff = self._target - self._progress
+        self._progress += diff * 0.04
+
+        # Spawn edge particles (not in waiting mode)
+        if self._active and not self._waiting_mode and self._progress > 0.01:
+            bar_y = self.height() // 2 + 40
+            bar_x = 60 + self._progress * (self.width() - 120)
+            if random.random() < 0.4:
+                self._particles.append(Particle(
+                    bar_x + random.randint(-8, 8),
+                    bar_y + random.randint(-6, 6)
+                ))
+
+        # Update particles
+        for p in self._particles:
+            p.update()
+        self._particles = [p for p in self._particles if p.is_alive()]
+        if len(self._particles) > 25:
+            self._particles = self._particles[-25:]
+
+        # Fade out when stopped — плавнее
+        if not self._active:
+            self._alpha = max(0.0, self._alpha - 0.025)
+            if self._alpha <= 0:
+                self._timer.stop()
+                self.hide()
+                self._particles.clear()
+                return
+
+        self.update()
+
+    def paintEvent(self, event):
+        if self._alpha <= 0:
+            return
+
+        w, h = self.width(), self.height()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self._alpha)
+
+        # Semi-transparent dark overlay
+        painter.fillRect(QRectF(0, 0, w, h), QColor(6, 3, 12, 190))
+
+        cx = w / 2
+        cy = h / 2
+
+        # ─── Animated glow orb ───
+        orb_r = 90 + math.sin(self._phase) * 25
+        orb_grad = QRadialGradient(cx, cy - 20, orb_r)
+        orb_grad.setColorAt(0, QColor(100, 60, 220, 35))
+        orb_grad.setColorAt(0.5, QColor(50, 140, 230, 15))
+        orb_grad.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.fillRect(QRectF(0, 0, w, h), orb_grad)
+
+        if self._waiting_mode:
+            self._paint_waiting(painter, w, h, cx, cy)
+        else:
+            self._paint_loading(painter, w, h, cx, cy - 40)
+
+        painter.end()
+
+    def _paint_waiting(self, painter, w, h, cx, cy):
+        """Отрисовка экрана 'Закройте Minecraft'."""
+        # ─── Pulsing circle ───
+        pulse = (math.sin(self._phase * 1.5) + 1) / 2  # 0..1
+        ring_r = 40 + pulse * 8
+        ring_alpha = int(60 + pulse * 40)
+        painter.setPen(QPen(QColor(100, 180, 240, ring_alpha), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(cx - ring_r, cy - 50 - ring_r, ring_r * 2, ring_r * 2))
+
+        # ─── Inner glow ───
+        inner = QRadialGradient(cx, cy - 50, ring_r * 0.7)
+        inner.setColorAt(0, QColor(80, 160, 230, int(20 + pulse * 15)))
+        inner.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(inner)
+        painter.drawEllipse(QRectF(cx - ring_r, cy - 50 - ring_r, ring_r * 2, ring_r * 2))
+
+        # ─── Main text ───
+        painter.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        # Gentle color pulsing
+        text_alpha = int(200 + pulse * 55)
+        painter.setPen(QColor(180, 210, 240, text_alpha))
+        painter.drawText(QRectF(0, cy - 5, w, 40),
+                         Qt.AlignmentFlag.AlignCenter, "Закройте Minecraft чтобы вернуться")
+
+        # ─── Subtitle ───
+        painter.setFont(QFont("Segoe UI", 11))
+        painter.setPen(QColor(120, 110, 160, 160))
+        painter.drawText(QRectF(0, cy + 40, w, 25),
+                         Qt.AlignmentFlag.AlignCenter, "Игра запущена • Amaterasu")
+
+        # ─── Decorative line ───
+        line_y = cy + 30
+        line_w = 200
+        line_grad = QLinearGradient(cx - line_w / 2, 0, cx + line_w / 2, 0)
+        line_grad.setColorAt(0, QColor(0, 0, 0, 0))
+        line_grad.setColorAt(0.3, QColor(80, 50, 180, int(80 + pulse * 40)))
+        line_grad.setColorAt(0.5, QColor(60, 160, 230, int(120 + pulse * 60)))
+        line_grad.setColorAt(0.7, QColor(80, 50, 180, int(80 + pulse * 40)))
+        line_grad.setColorAt(1, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(line_grad)
+        painter.drawRect(QRectF(cx - line_w / 2, line_y, line_w, 2))
+
+        # ─── Version text ───
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.setPen(QColor(90, 80, 130, 120))
+        painter.drawText(QRectF(0, cy + 70, w, 20),
+                         Qt.AlignmentFlag.AlignCenter, self._version)
+
+    def _paint_loading(self, painter, w, h, cx, cy):
+        """Отрисовка экрана загрузки (прогресс-бар, спиннер)."""
+        # ─── Version text ───
+        painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        painter.setPen(QColor(200, 170, 240, 220))
+        painter.drawText(QRectF(0, cy - 70, w, 30), Qt.AlignmentFlag.AlignCenter, self._version)
+
+        # ─── Spinning icon ───
+        spinner_r = 18
+        spinner_cx = cx
+        spinner_cy = cy - 15
+        for i in range(12):
+            angle = math.radians(self._phase * 60 + i * 30)
+            alpha_dot = int(255 * (1.0 - i / 12))
+            dot_x = spinner_cx + spinner_r * math.cos(angle)
+            dot_y = spinner_cy + spinner_r * math.sin(angle)
+            t = i / 12
+            painter.setBrush(QColor(
+                int(80 + 120 * t),
+                int(200 - 80 * t),
+                int(240),
+                alpha_dot
+            ))
+            painter.setPen(Qt.PenStyle.NoPen)
+            size = 3.5 - i * 0.15
+            painter.drawEllipse(QRectF(dot_x - size, dot_y - size, size * 2, size * 2))
+
+        # ─── Status text ───
+        painter.setFont(QFont("Segoe UI", 11))
+        painter.setPen(QColor(160, 140, 200, 200))
+        painter.drawText(QRectF(0, cy + 15, w, 25), Qt.AlignmentFlag.AlignCenter, self._status)
+
+        # ─── Progress bar ───
+        bar_x = 60
+        bar_y = cy + 50
+        bar_w = w - 120
+        bar_h = 10
+
+        # Bar background
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(20, 10, 35, 200))
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 5, 5)
+
+        # Bar border
+        painter.setPen(QPen(QColor(80, 50, 140, 80), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 5, 5)
+
+        # Bar fill
+        if self._progress > 0.005:
+            fill_w = max(10, self._progress * bar_w)
+            fill_grad = QLinearGradient(bar_x, 0, bar_x + fill_w, 0)
+            fill_grad.setColorAt(0, QColor(80, 40, 180))
+            fill_grad.setColorAt(0.4, QColor(60, 140, 230))
+            fill_grad.setColorAt(0.8, QColor(80, 200, 240))
+            fill_grad.setColorAt(1, QColor(140, 100, 240))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill_grad)
+            painter.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 5, 5)
+
+            # Glow on leading edge
+            edge_x = bar_x + fill_w
+            edge_glow = QRadialGradient(edge_x, bar_y + bar_h / 2, 25)
+            edge_glow.setColorAt(0, QColor(60, 180, 240, 120))
+            edge_glow.setColorAt(1, QColor(0, 0, 0, 0))
+            painter.setBrush(edge_glow)
+            painter.drawRect(QRectF(edge_x - 25, bar_y - 15, 50, bar_h + 30))
+
+        # ─── Percentage ───
+        pct = int(self._progress * 100)
+        painter.setFont(QFont("Segoe UI", 10))
+        painter.setPen(QColor(180, 160, 220, 180))
+        painter.drawText(QRectF(0, bar_y + bar_h + 8, w, 20),
+                         Qt.AlignmentFlag.AlignCenter, f"{pct}%")
+
+        # ─── Particles ───
+        for p in self._particles:
+            alpha_p = max(0, min(255, int(p.life * 200)))
+            color = QColor(60, 170, 240, alpha_p)
+            glow = QRadialGradient(p.x, p.y, p.size * 2.5)
+            glow.setColorAt(0, QColor(120, 200, 255, alpha_p))
+            glow.setColorAt(0.5, color)
+            glow.setColorAt(1, QColor(0, 0, 0, 0))
+            painter.setBrush(glow)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QRectF(
+                p.x - p.size, p.y - p.size,
+                p.size * 2, p.size * 2
+            ))
+
+        painter.end()
 
 
 # ─── Main Window ───
 
 class MainWindow(QMainWindow):
     BASE_WIDTH = 960
-    EXPANDED_WIDTH = 1340
+    EXPANDED_WIDTH = 1420
 
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAcceptDrops(True)  # для drag & drop фона
         self.setWindowTitle("Amaterasu")  # Чтобы в таскбаре и hover показывалось Amaterasu
         self.resize(self.BASE_WIDTH, 580)
         self.setMinimumSize(820, 480)
         self._drag_pos = None
+        self._panel_animating = False
+        self._panel_opacity = None
+        self._launch_animating = False
+        self._launch_version = ""
+        self._launch_username = ""
 
         # ─── Fade in setup ───
         self.setWindowOpacity(0.0)
@@ -1164,10 +1757,10 @@ class MainWindow(QMainWindow):
         main_h.setSpacing(0)
 
         # LEFT PANEL
-        left = QFrame()
-        left.setObjectName("LeftPanel")
-        left.setFixedWidth(300)
-        v = QVBoxLayout(left)
+        self.left_panel = QFrame()
+        self.left_panel.setObjectName("LeftPanel")
+        self.left_panel.setFixedWidth(300)
+        v = QVBoxLayout(self.left_panel)
         v.setContentsMargins(20, 12, 20, 16)
         v.setSpacing(8)
 
@@ -1261,7 +1854,7 @@ class MainWindow(QMainWindow):
         v.addLayout(icons_h)
         v.addStretch(0)
 
-        main_h.addWidget(left)
+        main_h.addWidget(self.left_panel)
 
         # CENTER (GIF)
         bg_path = Path(__file__).parent.parent / "assets" / "bg_amaterasu"
@@ -1272,7 +1865,7 @@ class MainWindow(QMainWindow):
         # RIGHT PANEL (initially hidden)
         self.right_panel = QFrame()
         self.right_panel.setObjectName("RightPanel")
-        self.right_panel.setFixedWidth(360)
+        self.right_panel.setFixedWidth(440)
         self.right_panel.setVisible(False)
 
         rv = QVBoxLayout(self.right_panel)
@@ -1299,7 +1892,12 @@ class MainWindow(QMainWindow):
         self._particles.setGeometry(central.rect())
         self._particles.hide()
 
-        self.setStyleSheet(stylesheet(self.mc_font, self.title_font))
+        # ─── Launch overlay (progress on GIF area) ───
+        self._launch_overlay = LaunchOverlay(central)
+        self._launch_overlay.hide()
+        self._launch_animating = False
+
+        self._apply_theme()
         self.refresh_main_versions()
 
         # ─── Если нет установленных версий — сразу открыть менеджер ───
@@ -1327,6 +1925,10 @@ class MainWindow(QMainWindow):
 
         self.all_versions_list = QListWidget()
         vv.addWidget(self.all_versions_list, 1)
+
+        # Spinner overlay на список версий
+        self.ver_spinner = GradientSpinner(52, self.all_versions_list)
+        self.ver_spinner.hide()
 
         btn_h = QHBoxLayout()
         btn_h.setSpacing(8)
@@ -1371,11 +1973,28 @@ class MainWindow(QMainWindow):
         self.set_java.setPlaceholderText("Автоопределение...")
         sv.addWidget(self.set_java)
 
-        sv.addWidget(QLabel("RAM:", styleSheet="color:#9080b0;font-size:12px;"))
-        self.set_ram = QComboBox()
-        self.set_ram.addItems(["1G","2G","3G","4G","6G","8G","12G","16G"])
-        self.set_ram.setCurrentText(self.settings.get("ram", "2G"))
-        sv.addWidget(self.set_ram)
+        ram_title = QLabel("RAM:")
+        ram_title.setObjectName("McLabel")
+        sv.addWidget(ram_title)
+        ram_h = QHBoxLayout()
+        ram_h.setSpacing(12)
+        self._ram_values = ["1G","2G","3G","4G","6G","8G","12G","16G"]
+        self.set_ram = QSlider(Qt.Orientation.Horizontal)
+        self.set_ram.setRange(0, len(self._ram_values) - 1)
+        self.set_ram.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.set_ram.setTickInterval(1)
+        self.set_ram.setSingleStep(1)
+        self.set_ram.setPageStep(1)
+        current_ram = self.settings.get("ram", "2G")
+        if current_ram in self._ram_values:
+            self.set_ram.setValue(self._ram_values.index(current_ram))
+        self.ram_label = QLabel(current_ram)
+        self.ram_label.setStyleSheet("color:#a080e0;font-size:18px;font-weight:bold;min-width:44px;")
+        self.ram_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.set_ram.valueChanged.connect(lambda i: self.ram_label.setText(self._ram_values[i]))
+        ram_h.addWidget(self.set_ram, 1)
+        ram_h.addWidget(self.ram_label)
+        sv.addLayout(ram_h)
 
         self.set_low_perf = QCheckBox("Низкая нагрузка на ПК")
         self.set_low_perf.setToolTip("Отключить частицы, замедлить анимации и эффекты в лаунчере для снижения нагрузки на ПК.")
@@ -1434,8 +2053,9 @@ class MainWindow(QMainWindow):
 
         # ─── IBE Editor card ───
         ibe_card = QFrame()
+        ibe_card.setObjectName("IbeCard")
         ibe_card.setStyleSheet("""
-            QFrame {
+            QFrame#IbeCard {
                 background-color: rgba(25, 12, 40, 200);
                 border: 1px solid rgba(120, 50, 180, 80);
                 border-radius: 10px;
@@ -1490,6 +2110,153 @@ class MainWindow(QMainWindow):
 
         self.right_stack.addWidget(mod_page)
 
+        # 4: Theme page — с scroll area
+        from PyQt6.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+
+        theme_inner = QWidget()
+        tv = QVBoxLayout(theme_inner)
+        tv.setContentsMargins(16, 12, 16, 12)
+        tv.setSpacing(0)
+
+        title4 = QLabel("🎨 Тема")
+        title4.setObjectName("PageTitle")
+        tv.addWidget(title4)
+        tv.addSpacing(16)
+
+        # ─── Colors ───
+        colors_header = QLabel("Цвета")
+        colors_header.setStyleSheet("font-size:15px;font-weight:bold;color:rgba(255,255,255,200);")
+        tv.addWidget(colors_header)
+        tv.addSpacing(10)
+
+        p1_h = QHBoxLayout()
+        p1_h.setSpacing(12)
+        self._primary_color = self.settings.get("theme_primary", "#8040c8")
+        self.btn_color_primary = QPushButton()
+        self.btn_color_primary.setFixedSize(40, 40)
+        self.btn_color_primary.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_color_primary.setToolTip("Основной цвет — нажми чтобы изменить")
+        self._update_color_btn(self.btn_color_primary, self._primary_color)
+        self.btn_color_primary.clicked.connect(self._pick_primary_color)
+        p1_lbl = QLabel("Основной")
+        p1_lbl.setFixedWidth(100)
+        self._primary_hex = QLabel(self._primary_color)
+        self._primary_hex.setFixedWidth(70)
+        p1_h.addWidget(self.btn_color_primary)
+        p1_h.addWidget(p1_lbl)
+        p1_h.addWidget(self._primary_hex)
+        p1_h.addStretch(1)
+        tv.addLayout(p1_h)
+        tv.addSpacing(8)
+
+        p2_h = QHBoxLayout()
+        p2_h.setSpacing(12)
+        self._secondary_color = self.settings.get("theme_secondary", "#40a8e8")
+        self.btn_color_secondary = QPushButton()
+        self.btn_color_secondary.setFixedSize(40, 40)
+        self.btn_color_secondary.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_color_secondary.setToolTip("Дополнительный цвет — нажми чтобы изменить")
+        self._update_color_btn(self.btn_color_secondary, self._secondary_color)
+        self.btn_color_secondary.clicked.connect(self._pick_secondary_color)
+        p2_lbl = QLabel("Дополнительный")
+        p2_lbl.setFixedWidth(100)
+        self._secondary_hex = QLabel(self._secondary_color)
+        self._secondary_hex.setFixedWidth(70)
+        p2_h.addWidget(self.btn_color_secondary)
+        p2_h.addWidget(p2_lbl)
+        p2_h.addWidget(self._secondary_hex)
+        p2_h.addStretch(1)
+        tv.addLayout(p2_h)
+        tv.addSpacing(12)
+
+        self._gradient_preview = QLabel()
+        self._gradient_preview.setFixedHeight(24)
+        self._gradient_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_gradient_preview()
+        tv.addWidget(self._gradient_preview)
+        tv.addSpacing(12)
+
+        btn_reset_theme = QPushButton("🔄 Сбросить цвета")
+        btn_reset_theme.setObjectName("ActBtn")
+        btn_reset_theme.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_reset_theme.clicked.connect(self._reset_theme)
+        tv.addWidget(btn_reset_theme)
+        tv.addSpacing(20)
+
+        tv.addWidget(GlowSeparator())
+        tv.addSpacing(20)
+
+        # ─── Background ───
+        bg_header = QLabel("🖼 Фон")
+        bg_header.setStyleSheet("font-size:15px;font-weight:bold;color:rgba(255,255,255,200);")
+        tv.addWidget(bg_header)
+        tv.addSpacing(6)
+
+        bg_lbl = QLabel("Перетащи GIF / PNG / JPG на окно\nили выбери файл вручную")
+        bg_lbl.setWordWrap(True)
+        bg_lbl.setStyleSheet("color:rgba(255,255,255,160);font-size:12px;")
+        tv.addWidget(bg_lbl)
+        tv.addSpacing(8)
+
+        self._bg_path_label = QLabel("")
+        custom_bg = self.settings.get("custom_bg", "")
+        if custom_bg and Path(custom_bg).exists():
+            self._bg_path_label.setText(f"📂 {Path(custom_bg).name}")
+        tv.addWidget(self._bg_path_label)
+        tv.addSpacing(8)
+
+        bg_btn_h = QHBoxLayout()
+        bg_btn_h.setSpacing(10)
+        self.btn_pick_bg = QPushButton("📁 Выбрать файл")
+        self.btn_pick_bg.setObjectName("ActBtn")
+        self.btn_pick_bg.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_pick_bg.clicked.connect(self._pick_background)
+        bg_btn_h.addWidget(self.btn_pick_bg)
+        btn_reset_bg = QPushButton("🔄 Сбросить фон")
+        btn_reset_bg.setObjectName("ActBtn")
+        btn_reset_bg.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_reset_bg.clicked.connect(self._reset_background)
+        bg_btn_h.addWidget(btn_reset_bg)
+        bg_btn_h.addStretch(1)
+        tv.addLayout(bg_btn_h)
+        tv.addSpacing(20)
+
+        tv.addWidget(GlowSeparator())
+        tv.addSpacing(20)
+
+        # ─── Share ───
+        share_header = QLabel("📤 Поделиться темой")
+        share_header.setStyleSheet("font-size:15px;font-weight:bold;color:rgba(255,255,255,200);")
+        tv.addWidget(share_header)
+        tv.addSpacing(10)
+
+        btn_export = QPushButton("💾 Сохранить тему в файл")
+        btn_export.setObjectName("ActBtn")
+        btn_export.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_export.clicked.connect(self._export_theme)
+        tv.addWidget(btn_export)
+
+        self._share_status = QLabel("")
+        self._share_status.setObjectName("VersionLabel")
+        tv.addWidget(self._share_status)
+
+        tv.addStretch(1)
+        tv.addSpacing(12)
+
+        # Back
+        btn_back_t = QPushButton("← Назад")
+        btn_back_t.setObjectName("ActBtn")
+        btn_back_t.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_back_t.clicked.connect(lambda: self._switch_page(0))
+        tv.addWidget(btn_back_t)
+
+        scroll.setWidget(theme_inner)
+        self.right_stack.addWidget(scroll)
+
     def _build_title_bar(self):
         self.title_bar = QWidget(self.centralWidget())
         self.title_bar.setObjectName("TopBar")
@@ -1536,7 +2303,7 @@ class MainWindow(QMainWindow):
         self._title_label.setStyleSheet("background: transparent;")
 
         title_glow = QGraphicsDropShadowEffect(self._title_label)
-        title_glow.setColor(QColor(140, 60, 220, 120))
+        title_glow.setColor(QColor(100, 110, 240, 150))
         if self.settings.get("low_perf", False):
             title_glow.setBlurRadius(8)
         else:
@@ -1558,13 +2325,14 @@ class MainWindow(QMainWindow):
             lbl.move(x, y)
 
     def paintEvent(self, event):
-        """Draw rounded window background."""
+        """Draw rounded window background with blur-through."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         path.addRoundedRect(QRectF(self.rect()), 14, 14)
         painter.setClipPath(path)
-        painter.fillRect(self.rect(), QColor(10, 4, 18))
+        alpha = 230 if getattr(self, '_blur_enabled', False) else 255
+        painter.fillRect(self.rect(), QColor(10, 4, 18, alpha))
         painter.end()
 
     def resizeEvent(self, event):
@@ -1579,6 +2347,8 @@ class MainWindow(QMainWindow):
         self._update_title_pos()
         if hasattr(self, "_particles"):
             self._particles.setGeometry(self.centralWidget().rect())
+        if hasattr(self, "_launch_overlay") and self._launch_overlay:
+            self._launch_overlay.setGeometry(self.centralWidget().rect())
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 44:
@@ -1596,6 +2366,36 @@ class MainWindow(QMainWindow):
         self._drag_pos = None
         super().mouseReleaseEvent(event)
 
+    # ─── Drag & Drop background ───
+
+    def dragEnterEvent(self, event):
+        """Разрешаем перетаскивание файлов-изображений, .amts тем и OptiFine .jar."""
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    ext = Path(url.toLocalFile()).suffix.lower()
+                    if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".amts"):
+                        event.acceptProposedAction()
+                        return
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Обрабатываем перетаскивание файла — фон, тема или OptiFine .jar."""
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                file_path = url.toLocalFile()
+                ext = Path(file_path).suffix.lower()
+                if ext == ".amts":
+                    self._apply_theme_from_file(file_path)
+                    return
+
+                elif ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                    self._set_background_from_file(file_path)
+                    return
+
     def _show_menu(self):
         pos = self.btn_menu.mapToGlobal(QPoint(-170, self.btn_menu.height() + 4))
         self.popup.move(pos)
@@ -1604,18 +2404,189 @@ class MainWindow(QMainWindow):
     def _switch_page(self, idx: int):
         self.popup.hide()
         if idx == 0:
-            if self.right_panel.isVisible():
-                self.right_panel.setVisible(False)
-                geo = self.geometry()
-                self.setGeometry(geo.x() + (geo.width() - self.BASE_WIDTH)//2, geo.y(),
-                                 self.BASE_WIDTH, geo.height())
+            if self.right_panel.isVisible() or self._panel_animating:
+                self._animate_panel_close()
         else:
             self.right_stack.setCurrentIndex(idx)
-            if not self.right_panel.isVisible():
-                self.right_panel.setVisible(True)
-                geo = self.geometry()
-                self.setGeometry(geo.x() + (geo.width() - self.EXPANDED_WIDTH)//2, geo.y(),
-                                 self.EXPANDED_WIDTH, geo.height())
+            if not self.right_panel.isVisible() and not self._panel_animating:
+                self._animate_panel_open()
+
+    # ─── Panel slide animation ───
+
+    def _animate_panel_open(self):
+        """Плавное выезжание правой панели."""
+        target_width = 440
+        duration = 500
+
+        # Останавливаем предыдущую анимацию если есть
+        self._stop_panel_anims()
+
+        self._panel_animating = True
+        self.right_panel.setVisible(True)
+        self.right_panel.setFixedWidth(1)
+
+        # Fade-in эффект для содержимого панели
+        if not hasattr(self, '_panel_opacity') or self._panel_opacity is None:
+            self._panel_opacity = QGraphicsOpacityEffect(self.right_stack)
+            self.right_stack.setGraphicsEffect(self._panel_opacity)
+        self._panel_opacity.setOpacity(0.0)
+
+        # Анимация ширины панели (minimumWidth)
+        self._anim_panel_min = QPropertyAnimation(self.right_panel, b"minimumWidth")
+        self._anim_panel_min.setDuration(duration)
+        self._anim_panel_min.setStartValue(1)
+        self._anim_panel_min.setEndValue(target_width)
+        self._anim_panel_min.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Анимация ширины панели (maximumWidth)
+        self._anim_panel_max = QPropertyAnimation(self.right_panel, b"maximumWidth")
+        self._anim_panel_max.setDuration(duration)
+        self._anim_panel_max.setStartValue(1)
+        self._anim_panel_max.setEndValue(target_width)
+        self._anim_panel_max.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Анимация размера окна
+        geo = self.geometry()
+        target_x = geo.x() + (geo.width() - self.EXPANDED_WIDTH) // 2
+        target_geo = QRect(target_x, geo.y(), self.EXPANDED_WIDTH, geo.height())
+
+        self._anim_window = QPropertyAnimation(self, b"geometry")
+        self._anim_window.setDuration(duration)
+        self._anim_window.setStartValue(geo)
+        self._anim_window.setEndValue(target_geo)
+        self._anim_window.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Анимация прозрачности содержимого
+        self._anim_fade = QPropertyAnimation(self._panel_opacity, b"opacity")
+        self._anim_fade.setDuration(int(duration * 0.65))
+        self._anim_fade.setStartValue(0.0)
+        self._anim_fade.setEndValue(1.0)
+        self._anim_fade.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        # Задержка перед появлением контента
+        self._anim_fade.setStartValue(0.0)
+        QTimer.singleShot(int(duration * 0.25), self._anim_fade.start)
+
+        # Все завершения
+        self._anim_panel_min.finished.connect(self._on_panel_open_done)
+
+        self._anim_panel_min.start()
+        self._anim_panel_max.start()
+        self._anim_window.start()
+
+    def _on_panel_open_done(self):
+        self._panel_animating = False
+        self.right_panel.setFixedWidth(440)
+
+    def _animate_panel_close(self):
+        """Плавное уезжание правой панели."""
+        duration = 400
+
+        self._stop_panel_anims()
+        self._panel_animating = True
+
+        current_width = self.right_panel.width()
+
+        # Fade-out для содержимого
+        if hasattr(self, '_panel_opacity') and self._panel_opacity:
+            self._anim_fade_out = QPropertyAnimation(self._panel_opacity, b"opacity")
+            self._anim_fade_out.setDuration(int(duration * 0.45))
+            self._anim_fade_out.setStartValue(self._panel_opacity.opacity())
+            self._anim_fade_out.setEndValue(0.0)
+            self._anim_fade_out.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._anim_fade_out.start()
+
+        # Анимация ширины панели
+        self._anim_panel_min = QPropertyAnimation(self.right_panel, b"minimumWidth")
+        self._anim_panel_min.setDuration(duration)
+        self._anim_panel_min.setStartValue(current_width)
+        self._anim_panel_min.setEndValue(0)
+        self._anim_panel_min.setEasingCurve(QEasingCurve.Type.InOutQuart)
+
+        self._anim_panel_max = QPropertyAnimation(self.right_panel, b"maximumWidth")
+        self._anim_panel_max.setDuration(duration)
+        self._anim_panel_max.setStartValue(current_width)
+        self._anim_panel_max.setEndValue(0)
+        self._anim_panel_max.setEasingCurve(QEasingCurve.Type.InOutQuart)
+
+        # Анимация размера окна
+        geo = self.geometry()
+        target_x = geo.x() + (geo.width() - self.BASE_WIDTH) // 2
+        target_geo = QRect(target_x, geo.y(), self.BASE_WIDTH, geo.height())
+
+        self._anim_window = QPropertyAnimation(self, b"geometry")
+        self._anim_window.setDuration(duration)
+        self._anim_window.setStartValue(geo)
+        self._anim_window.setEndValue(target_geo)
+        self._anim_window.setEasingCurve(QEasingCurve.Type.InOutQuart)
+
+        self._anim_panel_min.finished.connect(self._on_panel_close_done)
+
+        self._anim_panel_min.start()
+        self._anim_panel_max.start()
+        self._anim_window.start()
+
+    def _on_panel_close_done(self):
+        self._panel_animating = False
+        self.right_panel.setVisible(False)
+        self.right_panel.setFixedWidth(440)
+
+    def _stop_panel_anims(self):
+        """Останавливает все текущие анимации панели."""
+        for attr in ('_anim_panel_min', '_anim_panel_max', '_anim_window',
+                      '_anim_fade', '_anim_fade_out'):
+            anim = getattr(self, attr, None)
+            if anim is not None:
+                anim.stop()
+                anim.deleteLater()
+                setattr(self, attr, None)
+
+    # ─── Blur-behind effect (Windows DWM) ───
+
+    def _enable_blur(self):
+        """Включает blur-behind эффект (Windows Acrylic / BlurBehind)."""
+        self._blur_enabled = False
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import Structure, c_int, c_uint, c_size_t, POINTER, byref, sizeof
+
+            class ACCENT_POLICY(Structure):
+                _fields_ = [
+                    ("AccentState", c_int),
+                    ("AccentFlags", c_int),
+                    ("GradientColor", c_uint),
+                    ("AnimationId", c_int),
+                ]
+
+            class WINCOMPATTR_DATA(Structure):
+                _fields_ = [
+                    ("Attribute", c_int),
+                    ("Data", POINTER(ACCENT_POLICY)),
+                    ("SizeOfData", c_size_t),
+                ]
+
+            hwnd = int(self.winId())
+
+            # Try Acrylic (4) then BlurBehind (3)
+            for state in (4, 3):
+                accent = ACCENT_POLICY()
+                accent.AccentState = state
+                accent.AccentFlags = 2  # ACCENT_FLAG_DRAW_ALL
+                # ABGR: subtle dark-purple tint
+                accent.GradientColor = 0x01100814
+
+                data = WINCOMPATTR_DATA()
+                data.Attribute = 19  # WCA_ACCENT_POLICY
+                data.Data = ctypes.pointer(accent)
+                data.SizeOfData = sizeof(accent)
+
+                if ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, byref(data)):
+                    self._blur_enabled = True
+                    self.log("🔮 Blur-эффект включён")
+                    return
+        except Exception:
+            pass
 
     def log(self, text: str):
         self.log_edit.append(text)
@@ -1626,7 +2597,8 @@ class MainWindow(QMainWindow):
         self._fade_in()
 
     def _fade_in(self):
-        """Плавное появление окна."""
+        """Плавное появление окна + включение blur."""
+        self._enable_blur()
         self._fade_opacity = 0.0
         self._fade_timer = QTimer(self)
         self._fade_timer.setInterval(16)  # ~60fps
@@ -1634,7 +2606,7 @@ class MainWindow(QMainWindow):
         self._fade_timer.start()
 
     def _fade_tick(self):
-        self._fade_opacity += 0.04  # ~0.6 сек до полной непрозрачности
+        self._fade_opacity += 0.025  # ~1.1 сек до полной непрозрачности — плавнее
         if self._fade_opacity >= 1.0:
             self._fade_opacity = 1.0
             self._fade_timer.stop()
@@ -1645,11 +2617,49 @@ class MainWindow(QMainWindow):
         os.startfile(self.mc_dir)
         self.log(f"📁 {self.mc_dir}")
 
+    def _apply_theme(self):
+        """Применяет текущую тему (цвета + фон)."""
+        primary = self.settings.get("theme_primary", "#8040c8")
+        secondary = self.settings.get("theme_secondary", "#40a8e8")
+        self.setStyleSheet(stylesheet(self.mc_font, self.title_font, primary, secondary))
+        # Custom background
+        custom_bg = self.settings.get("custom_bg", "")
+        if custom_bg and Path(custom_bg).exists():
+            bg_path = Path(custom_bg)
+        else:
+            bg_path = Path(__file__).parent.parent / "assets" / "bg_amaterasu"
+        # Update center GIF if needed
+        if hasattr(self, 'center_gif'):
+            # Recreate GifBg
+            old_gif = self.center_gif
+            new_gif = GifBg(bg_path)
+            new_gif.setObjectName("CenterBg")
+            layout = self.centralWidget().layout()
+            idx = layout.indexOf(old_gif)
+            layout.removeWidget(old_gif)
+            old_gif.deleteLater()
+            layout.insertWidget(idx, new_gif, 1)
+            self.center_gif = new_gif
+            # Move launch overlay to new parent
+            if hasattr(self, '_launch_overlay'):
+                self._launch_overlay.setParent(self.centralWidget())
+
     def refresh_main_versions(self):
         self.version_combo.clear()
         installed = get_installed_versions_list(self.mc_dir)
         if installed:
-            self.version_combo.addItems(installed)
+            for v in installed:
+                vl = v.lower()
+                if "optifine" in vl and ("forge" in vl or "neoforge" in vl):
+                    self.version_combo.addItem("🟠  " + v)
+                elif "forge" in vl or "neoforge" in vl or "ite" in vl:
+                    self.version_combo.addItem("🟡  " + v)
+                elif "fabric" in vl:
+                    self.version_combo.addItem("🔵  " + v)
+                elif "snapshot" in vl:
+                    self.version_combo.addItem("🔴  " + v)
+                else:
+                    self.version_combo.addItem("🟢  " + v)
             self.log(f"📋 Установлено: {len(installed)}")
         else:
             self.version_combo.addItem("Нет установленных")
@@ -1657,38 +2667,177 @@ class MainWindow(QMainWindow):
 
     def _on_play(self):
         version = self.version_combo.currentText().strip()
+        # Strip emoji prefix from version
+        for prefix in ["🟢  ", "🟡  ", "🟠  ", "🔵  ", "🔴  "]:
+            if version.startswith(prefix):
+                version = version[len(prefix):]
+                break
         username = self.nick_edit.text().strip()
         if not version or version.startswith("Нет") or not username:
             self.log("⚠️ Заполни версию и ник")
             return
 
+        # Close right panel INSTANTLY if open (no animation — avoid conflicts)
+        if self.right_panel.isVisible():
+            self._stop_panel_anims()
+            self.right_panel.setVisible(False)
+            self.right_panel.setFixedWidth(440)
+            # Resize window to BASE_WIDTH immediately
+            geo = self.geometry()
+            offset = (geo.width() - self.BASE_WIDTH) // 2
+            self.setGeometry(geo.x() + offset, geo.y(),
+                             self.BASE_WIDTH, geo.height())
+
         self.log(f"📦 {version}...")
         self.play_btn.setEnabled(False)
         self.play_btn.start_loading("ЗАГРУЗКА...")
+        self._launch_version = version
+        self._launch_username = username
 
-        # ─── Launch particles from button (отключено в low_perf режиме для оптимизации) ───
-        if not self.settings.get("low_perf", False):
-            btn_rect = self.play_btn.geometry()
-            # Convert to central widget coords
-            btn_pos = self.play_btn.mapTo(self.centralWidget(), QPoint(0, 0))
-            source_rect = self.play_btn.rect()
-            source_rect.moveTopLeft(btn_pos)
-            self._particles.setGeometry(self.centralWidget().rect())
-            self._particles.start(source_rect)
+        # ─── Animate left panel out + show launch overlay ───
+        self._animate_left_out()
+
+    # ─── Left panel slide animations for launch ───
+
+    def _animate_left_out(self):
+        """Убирает левую панель влево с анимацией."""
+        if self._launch_animating:
+            return
+        self._launch_animating = True
+
+        # Stop particles
+        self._particles.stop()
+
+        duration = 550
+        current_w = self.left_panel.width()
+
+        # Animate minimumWidth 300 → 0
+        self._anim_left_min = QPropertyAnimation(self.left_panel, b"minimumWidth")
+        self._anim_left_min.setDuration(duration)
+        self._anim_left_min.setStartValue(current_w)
+        self._anim_left_min.setEndValue(0)
+        self._anim_left_min.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Animate maximumWidth 300 → 0
+        self._anim_left_max = QPropertyAnimation(self.left_panel, b"maximumWidth")
+        self._anim_left_max.setDuration(duration)
+        self._anim_left_max.setStartValue(current_w)
+        self._anim_left_max.setEndValue(0)
+        self._anim_left_max.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Resize window smaller
+        geo = self.geometry()
+        target_x = geo.x() + current_w
+        target_geo = QRect(target_x, geo.y(), geo.width() - current_w, geo.height())
+        self._anim_left_win = QPropertyAnimation(self, b"geometry")
+        self._anim_left_win.setDuration(duration)
+        self._anim_left_win.setStartValue(geo)
+        self._anim_left_win.setEndValue(target_geo)
+        self._anim_left_win.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        self._anim_left_out_done = False
+        self._anim_left_min.finished.connect(self._on_left_out_done)
+
+        self._anim_left_min.start()
+        self._anim_left_max.start()
+        self._anim_left_win.start()
+
+        # Show launch overlay with delay
+        QTimer.singleShot(int(duration * 0.4), self._show_launch_overlay)
+
+    def _show_launch_overlay(self):
+        """Показывает overlay с прогрессом на всём central widget."""
+        central = self.centralWidget()
+        self._launch_overlay.setParent(central)
+        self._launch_overlay.setGeometry(central.rect())
+        self._launch_overlay.start(self._launch_version)
+        # Держим title bar поверх overlay чтобы кнопки свернуть/закрыть работали
+        if hasattr(self, 'title_bar'):
+            self.title_bar.raise_()
+        # Start install thread
+        self._start_install()
+
+    def _on_left_out_done(self):
+        self._launch_animating = False
+        self.left_panel.setVisible(False)
+
+    def _animate_left_in(self):
+        """Возвращает левую панель с анимацией."""
+        duration = 550
+        target_w = 300
+
+        self.left_panel.setVisible(True)
+
+        # Animate minimumWidth 0 → 300
+        self._anim_left_min = QPropertyAnimation(self.left_panel, b"minimumWidth")
+        self._anim_left_min.setDuration(duration)
+        self._anim_left_min.setStartValue(0)
+        self._anim_left_min.setEndValue(target_w)
+        self._anim_left_min.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Animate maximumWidth 0 → 300
+        self._anim_left_max = QPropertyAnimation(self.left_panel, b"maximumWidth")
+        self._anim_left_max.setDuration(duration)
+        self._anim_left_max.setStartValue(0)
+        self._anim_left_max.setEndValue(target_w)
+        self._anim_left_max.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        # Resize window bigger
+        geo = self.geometry()
+        target_x = geo.x() - target_w
+        target_geo = QRect(target_x, geo.y(), geo.width() + target_w, geo.height())
+        self._anim_left_win = QPropertyAnimation(self, b"geometry")
+        self._anim_left_win.setDuration(duration)
+        self._anim_left_win.setStartValue(geo)
+        self._anim_left_win.setEndValue(target_geo)
+        self._anim_left_win.setEasingCurve(QEasingCurve.Type.OutQuint)
+
+        self._anim_left_min.start()
+        self._anim_left_max.start()
+        self._anim_left_win.start()
+
+    def _start_install(self):
+        """Запускает поток установки Minecraft."""
+        version = self._launch_version
+        username = self._launch_username
 
         self.play_progress.setVisible(True)
         self.play_progress.setMaximum(0)
         self.play_progress.setValue(0)
         self.play_progress.setFormat("Подготовка...")
 
+        self._launch_overlay.set_status("Подготовка...")
+
         self.inst_thread = InstallThread(version, username, self.mc_dir, self.settings, self)
-        self.inst_thread.log_signal.connect(self.log)
+        self.inst_thread.log_signal.connect(self._on_launch_log)
         self.inst_thread.progress_signal.connect(self._on_play_progress)
         self.inst_thread.finished_signal.connect(self._on_play_done)
+        self.inst_thread.launched_signal.connect(self._on_mc_launched)
         self.inst_thread.error_signal.connect(self._on_play_error)
         self.inst_thread.start()
 
+    def _on_mc_launched(self, mc_process):
+        """Minecraft процесс запущен — переключаем overlay в waiting mode."""
+        self._launch_overlay.mc_closed_signal.connect(self._on_mc_closed)
+        self._launch_overlay.start_waiting(mc_process)
+        self.log("🎮 Minecraft запущен — ожидание закрытия...")
+
+    def _on_mc_closed(self):
+        """Minecraft закрыт — возвращаем панель."""
+        self.log("🎮 Minecraft закрыт — возврат интерфейса")
+        self._after_launch_done()
+
+    def _on_launch_log(self, text: str):
+        """Логирует в консоль и обновляет статус overlay."""
+        self.log(text)
+        # Update overlay status from log messages
+        if "..." in text or "📦" in text or "☕" in text or "🚀" in text:
+            clean = text.replace("📦", "").replace("☕", "").replace("🚀", "").replace("✅", "").strip()
+            if clean:
+                self._launch_overlay.set_status(clean)
+
     def _on_play_progress(self, cur: int, tot: int):
+        self._launch_overlay.set_progress(cur, tot)
         if tot > 0:
             self.play_progress.setMaximum(tot)
             self.play_progress.setValue(cur)
@@ -1701,6 +2850,15 @@ class MainWindow(QMainWindow):
         self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
         self.play_progress.setVisible(False)
         self._particles.stop()
+        # Minecraft launched — stay on overlay with "close to return" message
+        self._launch_overlay.set_status("✅ Minecraft запущен!")
+        self._launch_overlay._target = 1.0
+        self._launch_overlay._progress = 1.0
+
+    def _after_launch_done(self):
+        """Скрывает overlay и возвращает панель."""
+        self._launch_overlay.stop()
+        self._animate_left_in()
 
     def _on_play_error(self, msg: str):
         self.log(f"❌ {msg}")
@@ -1708,21 +2866,49 @@ class MainWindow(QMainWindow):
         self.play_btn.stop_loading("▶  ЗАПУСТИТЬ")
         self.play_progress.setVisible(False)
         self._particles.stop()
+        # Fade out overlay and bring panel back
+        self._launch_overlay.set_status(f"❌ Ошибка: {msg}")
+        QTimer.singleShot(2000, self._after_launch_done)
 
     def _start_version_load(self):
         """Запускает загрузку списка версий в отдельном потоке."""
         self.ver_status.setText("⏳ Загрузка списка версий...")
         self.log("⏳ Загрузка списка версий...")
+        self._show_ver_spinner()
         self._ver_thread = VersionListThread(self)
         self._ver_thread.finished.connect(self._on_versions_loaded)
         self._ver_thread.error.connect(lambda e: (
             self.ver_status.setText(f"❌ {e}"),
-            self.log(f"❌ Ошибка: {e}")
+            self.log(f"❌ Ошибка: {e}"),
+            self._hide_ver_spinner()
         ))
         self._ver_thread.start()
 
+    def _show_ver_spinner(self):
+        """Центрирует и показывает спиннер на списке версий."""
+        lw = self.all_versions_list
+        self.ver_spinner.setParent(lw)
+        # Позиционируем после того как виджет получит размер
+        QTimer.singleShot(50, self._center_ver_spinner)
+        self.ver_spinner.start()
+
+    def _center_ver_spinner(self):
+        """Центрирует спиннер в списке версий."""
+        lw = self.all_versions_list
+        vp = lw.viewport()
+        self.ver_spinner.move(
+            (vp.width() - self.ver_spinner.width()) // 2,
+            (vp.height() - self.ver_spinner.height()) // 2
+        )
+        self.ver_spinner.raise_()
+
+    def _hide_ver_spinner(self):
+        """Скрывает спиннер."""
+        self.ver_spinner.stop()
+
     def _on_versions_loaded(self, versions: list):
         """Обработка загруженного списка версий."""
+        self._hide_ver_spinner()
         self.all_versions_list.clear()
         self._all_versions_raw = []
         self._all_display_items = []
@@ -1730,7 +2916,38 @@ class MainWindow(QMainWindow):
         if not versions:
             self.ver_status.setText("❌ Список пуст — проверь интернет")
             self.log("❌ Не удалось загрузить версии")
+            self._hide_ver_spinner()
             return
+
+        # Получаем список MC-версий, для которых есть OptiFine
+        of_versions = {
+            "1.7.2", "1.7.10", "1.8.0", "1.8.8", "1.8.9",
+            "1.9.0", "1.9.2", "1.9.4", "1.10", "1.10.2",
+            "1.11", "1.11.2", "1.12", "1.12.1", "1.12.2",
+            "1.13", "1.13.1", "1.13.2", "1.14.2", "1.14.3", "1.14.4",
+            "1.15.2", "1.16.1", "1.16.2", "1.16.3", "1.16.4", "1.16.5",
+            "1.17.1", "1.18", "1.18.1", "1.18.2",
+            "1.19", "1.19.1", "1.19.2", "1.19.3", "1.19.4",
+            "1.20.1", "1.20.4", "1.20.6",
+            "1.21", "1.21.1", "1.21.3", "1.21.4",
+            "1.21.6", "1.21.7", "1.21.8", "1.21.9", "1.21.10", "1.21.11",
+        }
+        try:
+            import urllib.request
+            api_url = "https://bmclapi2.bangbang93.com/optifine/versionlist"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=8)
+            data = json.loads(resp.read())
+            api_versions = set()
+            for item in data:
+                mc_ver = item.get("mcversion", "")
+                if mc_ver and not item.get("filename", "").startswith("preview_"):
+                    api_versions.add(mc_ver)
+            if api_versions:
+                of_versions = api_versions  # API актуальнее
+            self.log(f"📋 OptiFine доступен для {len(of_versions)} версий")
+        except Exception:
+            self.log(f"📋 OptiFine: встроенный список ({len(of_versions)} версий)")
 
         for v in versions:
             if v.get("type") == "release":
@@ -1738,10 +2955,25 @@ class MainWindow(QMainWindow):
                 vid = v["id"]
                 self._all_display_items.append((vid, vid, "vanilla"))
                 self._all_display_items.append((f"{vid} — Forge", vid, "forge"))
+                if vid in of_versions:
+                    self._all_display_items.append((f"{vid} — OptiFine", vid, "forgeoptifine"))
                 self._all_display_items.append((f"{vid} — Fabric", vid, "fabric"))
 
-        for display, _, _ in self._all_display_items:
-            self.all_versions_list.addItem(display)
+        for display, _, mod_type in self._all_display_items:
+            item = QListWidgetItem()
+            if mod_type == "vanilla":
+                item.setText("🟢  " + display)
+                item.setForeground(QColor("#50e878"))
+            elif mod_type == "forge":
+                item.setText("🟡  " + display)
+                item.setForeground(QColor("#f0b830"))
+            elif mod_type == "forgeoptifine":
+                item.setText("🟠  " + display)
+                item.setForeground(QColor("#ff8c00"))
+            elif mod_type == "fabric":
+                item.setText("🔵  " + display)
+                item.setForeground(QColor("#40a8f0"))
+            self.all_versions_list.addItem(item)
 
         self.ver_status.setText(f"✅ Загружено {len(self._all_versions_raw)} релизов")
         self.log(f"📋 Доступно {len(self._all_versions_raw)} версий")
@@ -1757,12 +2989,43 @@ class MainWindow(QMainWindow):
                 self.log("❌ Список версий пуст — проверь интернет")
                 return
 
+            # Получаем список MC-версий с OptiFine
+            of_versions = {
+                "1.7.2", "1.7.10", "1.8.0", "1.8.8", "1.8.9",
+                "1.9.0", "1.9.2", "1.9.4", "1.10", "1.10.2",
+                "1.11", "1.11.2", "1.12", "1.12.1", "1.12.2",
+                "1.13", "1.13.1", "1.13.2", "1.14.2", "1.14.3", "1.14.4",
+                "1.15.2", "1.16.1", "1.16.2", "1.16.3", "1.16.4", "1.16.5",
+                "1.17.1", "1.18", "1.18.1", "1.18.2",
+                "1.19", "1.19.1", "1.19.2", "1.19.3", "1.19.4",
+                "1.20.1", "1.20.4", "1.20.6",
+                "1.21", "1.21.1", "1.21.3", "1.21.4",
+                "1.21.6", "1.21.7", "1.21.8", "1.21.9", "1.21.10", "1.21.11",
+            }
+            try:
+                import urllib.request
+                api_url = "https://bmclapi2.bangbang93.com/optifine/versionlist"
+                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req, timeout=8)
+                data = json.loads(resp.read())
+                api_versions = set()
+                for item in data:
+                    mc_ver = item.get("mcversion", "")
+                    if mc_ver and not item.get("filename", "").startswith("preview_"):
+                        api_versions.add(mc_ver)
+                if api_versions:
+                    of_versions = api_versions
+            except Exception:
+                pass
+
             for v in versions:
                 if v.get("type") == "release":
                     self._all_versions_raw.append(v)
                     vid = v["id"]
                     self._all_display_items.append((vid, vid, "vanilla"))
                     self._all_display_items.append((f"{vid} — Forge", vid, "forge"))
+                    if vid in of_versions:
+                        self._all_display_items.append((f"{vid} — OptiFine", vid, "forgeoptifine"))
                     self._all_display_items.append((f"{vid} — Fabric", vid, "fabric"))
 
             for display, _, _ in self._all_display_items:
@@ -1780,7 +3043,20 @@ class MainWindow(QMainWindow):
             display_lower = display.lower()
             display_clean = display_lower.replace(".", "").replace(" ", "").replace("—", "")
             if text.lower() in display_lower or search in display_clean:
-                self.all_versions_list.addItem(display)
+                item = QListWidgetItem()
+                if mod_type == "vanilla":
+                    item.setText("🟢  " + display)
+                    item.setForeground(QColor("#50e878"))
+                elif mod_type == "forge":
+                    item.setText("🟡  " + display)
+                    item.setForeground(QColor("#f0b830"))
+                elif mod_type == "forgeoptifine":
+                    item.setText("🟠  " + display)
+                    item.setForeground(QColor("#ff8c00"))
+                elif mod_type == "fabric":
+                    item.setText("🔵  " + display)
+                    item.setForeground(QColor("#40a8f0"))
+                self.all_versions_list.addItem(item)
 
     def _on_download_version(self):
         item = self.all_versions_list.currentItem()
@@ -1790,8 +3066,17 @@ class MainWindow(QMainWindow):
 
         display = item.text()
 
-        # Определяем тип: vanilla / forge / fabric
-        if "— Forge" in display:
+        # Strip emoji prefix
+        for prefix in ["🟢  ", "🟡  ", "🟠  ", "🔵  ", "🔴  "]:
+            if display.startswith(prefix):
+                display = display[len(prefix):]
+                break
+
+        # Определяем тип: vanilla / forge / forgeoptifine / fabric
+        if "— OptiFine" in display:
+            mod_type = "forgeoptifine"
+            mc_ver = display.replace(" — OptiFine", "").strip()
+        elif "— Forge" in display:
             mod_type = "forge"
             mc_ver = display.replace(" — Forge", "").strip()
         elif "— Fabric" in display:
@@ -1888,7 +3173,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         self.settings["java_path"] = self.set_java.text().strip()
-        self.settings["ram"] = self.set_ram.currentText()
+        self.settings["ram"] = self._ram_values[self.set_ram.value()]
         try:
             self.settings["window_width"] = int(self.set_w.text())
             self.settings["window_height"] = int(self.set_h.text())
@@ -1899,6 +3184,271 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.log("💾 Настройки сохранены")
         self._switch_page(0)
+
+    # ─── Theme methods ───
+
+    def _update_color_btn(self, btn: QPushButton, hex_color: str):
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {hex_color};
+                border: 2px solid rgba(255,255,255,60);
+                border-radius: 8px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid rgba(255,255,255,120);
+            }}
+        """)
+
+    def _gradient_ss(self) -> str:
+        return (f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                f"stop:0 {self._primary_color}, stop:1 {self._secondary_color});"
+                f"border-radius:6px;border:1px solid rgba(255,255,255,30);")
+
+    def _update_gradient_preview(self):
+        if hasattr(self, '_gradient_preview'):
+            self._gradient_preview.setStyleSheet(
+                self._gradient_ss() + "font-size:10px;color:rgba(255,255,255,160);")
+
+    def _pick_primary_color(self):
+        color = QColorDialog.getColor(QColor(self._primary_color), self, "Основной цвет")
+        if color.isValid():
+            self._primary_color = color.name()
+            self._update_color_btn(self.btn_color_primary, self._primary_color)
+            self._primary_hex.setText(self._primary_color)
+            self._update_gradient_preview()
+            self.settings["theme_primary"] = self._primary_color
+            save_settings(self.settings)
+            self._apply_theme()
+
+    def _pick_secondary_color(self):
+        color = QColorDialog.getColor(QColor(self._secondary_color), self, "Дополнительный цвет")
+        if color.isValid():
+            self._secondary_color = color.name()
+            self._update_color_btn(self.btn_color_secondary, self._secondary_color)
+            self._secondary_hex.setText(self._secondary_color)
+            self._update_gradient_preview()
+            self.settings["theme_secondary"] = self._secondary_color
+            save_settings(self.settings)
+            self._apply_theme()
+
+    def _reset_theme(self):
+        self._primary_color = "#8040c8"
+        self._secondary_color = "#40a8e8"
+        self._update_color_btn(self.btn_color_primary, self._primary_color)
+        self._update_color_btn(self.btn_color_secondary, self._secondary_color)
+        self._primary_hex.setText(self._primary_color)
+        self._secondary_hex.setText(self._secondary_color)
+        self._update_gradient_preview()
+        self.settings["theme_primary"] = self._primary_color
+        self.settings["theme_secondary"] = self._secondary_color
+        save_settings(self.settings)
+        self._apply_theme()
+        self.log("🎨 Тема сброшена")
+
+    def _set_background_from_file(self, file_path: str):
+        """Устанавливает файл как фон лаунчера (из drag&drop или файлового диалога)."""
+        assets_dir = Path(__file__).parent.parent / "assets"
+        ext = Path(file_path).suffix
+        dest = assets_dir / f"custom_bg{ext}"
+        import shutil
+        shutil.copy2(file_path, str(dest))
+        self.settings["custom_bg"] = str(dest)
+        save_settings(self.settings)
+        if hasattr(self, '_bg_path_label'):
+            self._bg_path_label.setText(f"📂 {dest.name}")
+        self._apply_theme()
+        self.log(f"🖼 Фон установлен: {dest.name}")
+
+    def _pick_background(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать фон лаунчера", "",
+            "Изображения (*.png *.jpg *.jpeg *.gif *.webp);;Все файлы (*)"
+        )
+        if file_path:
+            self._set_background_from_file(file_path)
+
+    def _reset_background(self):
+        self.settings["custom_bg"] = ""
+        save_settings(self.settings)
+        self._bg_path_label.setText("")
+        self._apply_theme()
+        self.log("🖼 Фон сброшен")
+
+    # ─── Theme share system (short codes) ───
+
+    _B62 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+    @staticmethod
+    def _b62_encode(num: int) -> str:
+        if num == 0:
+            return "A"
+        s = ""
+        while num > 0:
+            s = MainWindow._B62[num % 62] + s
+            num //= 62
+        return s
+
+    @staticmethod
+    def _b62_decode(s: str) -> int:
+        num = 0
+        for c in s:
+            num = num * 62 + MainWindow._B62.index(c)
+        return num
+
+    @staticmethod
+    def _hex_to_int(h: str) -> int:
+        return int(h.lstrip("#"), 16)
+
+    @staticmethod
+    def _int_to_hex(n: int) -> str:
+        return f"#{n:06x}"
+
+    def _export_theme(self):
+        """Сохраняет тему в файл .amts и открывает папку."""
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "💾 Название темы",
+            "Как назвать тему?",
+            text="Моя тема"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        # Убираем запрещённые символы в имени файла
+        safe_name = "".join(c for c in name if c not in r'\/:*?"<>|').strip()
+        if not safe_name:
+            safe_name = "AmaterasuTheme"
+        try:
+            theme_data = {
+                "format": "amaterasu-theme",
+                "version": 1,
+                "name": name,
+                "primary": self.settings.get("theme_primary", "#8040c8"),
+                "secondary": self.settings.get("theme_secondary", "#40a8e8"),
+            }
+
+            # Фон
+            custom_bg = self.settings.get("custom_bg", "")
+            if custom_bg and Path(custom_bg).exists():
+                bg_path = Path(custom_bg)
+                file_size = bg_path.stat().st_size
+                if file_size > 8 * 1024 * 1024:
+                    self._share_status.setText("⚠️ Фон >8МБ — только цвета")
+                    self.log("⚠️ Фон слишком большой, сохранены только цвета")
+                else:
+                    with open(bg_path, "rb") as f:
+                        img_raw = f.read()
+                    compressed = zlib.compress(img_raw, 9)
+                    theme_data["bg_ext"] = bg_path.suffix[1:]  # gif/png/jpg
+                    theme_data["bg_data"] = base64.b64encode(compressed).decode("ascii")
+
+            # Сохраняем файл на рабочий стол
+            desktop = Path.home() / "Desktop"
+            if not desktop.exists():
+                desktop = Path.home()
+            filename = f"{safe_name}.amts"
+            dest = desktop / filename
+
+            json_out = json.dumps(theme_data, indent=2, ensure_ascii=False)
+            dest.write_text(json_out, encoding="utf-8")
+
+            self._share_status.setText(f"✅ Сохранено: {dest.name}")
+            self.log(f"📤 Тема сохранена: {dest}")
+
+            # Открыть папку с файлом
+            if os.name == "nt":
+                os.startfile(str(desktop))
+            else:
+                import subprocess as sp
+                sp.Popen(["xdg-open", str(desktop)])
+
+            # Показать инструкцию
+            QMessageBox.information(
+                self, "📤 Тема сохранена!",
+                f"Файл сохранён на рабочий стол:\n\n"
+                f"📄 {filename}\n\n"
+                f"━━━ Как поделиться ━━━\n\n"
+                f"1. Отправь файл {filename} другу\n"
+                f"   (Discord, Telegram, email — как угодно)\n\n"
+                f"2. Друг перетаскивает файл на окно лаунчера\n\n"
+                f"3. Тема применяется автоматически!"
+            )
+
+        except Exception as e:
+            self._share_status.setText(f"❌ {e}")
+            self.log(f"❌ Ошибка: {e}")
+
+    def _import_theme_file(self):
+        """Выбирает .amts файл и применяет тему."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать файл темы", "",
+            "Тема Amaterasu (*.amts);;Все файлы (*)"
+        )
+        if file_path:
+            self._apply_theme_from_file(file_path)
+
+    def _apply_theme_from_file(self, file_path: str):
+        """Читает .amts файл и применяет тему."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                theme_data = json.loads(f.read())
+
+            if theme_data.get("format") != "amaterasu-theme":
+                self._share_status.setText("❌ Это не файл темы Amaterasu")
+                self.log("❌ Неверный формат файла")
+                return
+
+            # Применяем цвета
+            if "primary" in theme_data:
+                self._primary_color = theme_data["primary"]
+                self.settings["theme_primary"] = self._primary_color
+                self._update_color_btn(self.btn_color_primary, self._primary_color)
+                self._primary_hex.setText(self._primary_color)
+
+            if "secondary" in theme_data:
+                self._secondary_color = theme_data["secondary"]
+                self.settings["theme_secondary"] = self._secondary_color
+                self._update_color_btn(self.btn_color_secondary, self._secondary_color)
+                self._secondary_hex.setText(self._secondary_color)
+
+            self._update_gradient_preview()
+
+            # Применяем фон
+            if "bg_data" in theme_data and "bg_ext" in theme_data:
+                compressed = base64.b64decode(theme_data["bg_data"])
+                img_data = zlib.decompress(compressed)
+                assets_dir = Path(__file__).parent.parent / "assets"
+                ext = theme_data["bg_ext"]
+                dest = assets_dir / f"custom_bg.{ext}"
+                with open(dest, "wb") as f:
+                    f.write(img_data)
+                self.settings["custom_bg"] = str(dest)
+                self._bg_path_label.setText(f"📂 {dest.name}")
+                self.log(f"🖼 Фон: {dest.name}")
+
+            save_settings(self.settings)
+            self._apply_theme()
+
+            fname = Path(file_path).name
+            has_bg = "bg_data" in theme_data
+            self._share_status.setText(f"✅ Тема применена из {fname}")
+            self.log(f"📥 Тема применена из файла {fname}")
+
+            QMessageBox.information(
+                self, "📥 Тема применена!",
+                f"Файл: {fname}\n\n"
+                f"🎨 Основной: {self._primary_color}\n"
+                f"🎨 Дополнительный: {self._secondary_color}\n"
+                f"🖼 Фон: {'✅ установлен' if has_bg else '❌ нет'}"
+            )
+
+        except json.JSONDecodeError:
+            self._share_status.setText("❌ Файл повреждён")
+            self.log("❌ Файл темы повреждён")
+        except Exception as e:
+            self._share_status.setText(f"❌ {e}")
+            self.log(f"❌ Ошибка: {e}")
+            self.log(f"❌ Ошибка: {e}")
 
 
 if __name__ == "__main__":
