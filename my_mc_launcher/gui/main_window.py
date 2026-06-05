@@ -27,6 +27,16 @@ import minecraft_launcher_lib as mll
 
 SETTINGS_PATH = Path(__file__).parent.parent / "launcher_settings.json"
 
+# ─── Скрытие консольных окон дочерних процессов (Windows) ───
+# Без этого каждый запуск java/minecraft открывает чёрное окно консоли.
+if os.name == "nt":
+    CREATE_NO_WINDOW = 0x08000000
+    _si = subprocess.STARTUPINFO()
+    _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    NO_WINDOW_KWARGS = {"creationflags": CREATE_NO_WINDOW, "startupinfo": _si}
+else:
+    NO_WINDOW_KWARGS = {}
+
 
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
@@ -210,7 +220,7 @@ class InstallThread(QThread):
                 self.log_signal.emit(f"☕ Используемая Java: {java_exe}")
                 # Проверить версию Java (чтобы сразу видеть, 21 или 25/26)
                 try:
-                    ver_out = subprocess.check_output([java_exe, "-version"], stderr=subprocess.STDOUT, text=True, timeout=10)
+                    ver_out = subprocess.check_output([java_exe, "-version"], stderr=subprocess.STDOUT, text=True, timeout=10, **NO_WINDOW_KWARGS)
                     first_line = ver_out.splitlines()[0] if ver_out else "неизвестно"
                     self.log_signal.emit(f"☕ Версия Java: {first_line}")
                 except Exception as e:
@@ -233,7 +243,7 @@ class InstallThread(QThread):
             self.log_signal.emit(f"☕ Java в команде: {Path(cmd[0]).name}")
             self.log_signal.emit(f"🚀 Полная команда (первые 12 аргументов): {' '.join(cmd[:12])} ...")
             self.log_signal.emit("🚀 Запуск Minecraft...")
-            subprocess.Popen(cmd, cwd=str(self.mc_dir))
+            subprocess.Popen(cmd, cwd=str(self.mc_dir), **NO_WINDOW_KWARGS)
             self.finished_signal.emit()
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -364,7 +374,7 @@ class IBEInstallThread(QThread):
             try:
                 subprocess.run(
                     [java_path, "-jar", str(installer_jar), "--installClient", str(self.mc_dir)],
-                    check=True, capture_output=True, text=True
+                    check=True, capture_output=True, text=True, **NO_WINDOW_KWARGS
                 )
             except subprocess.CalledProcessError as e:
                 self.error_signal.emit(f"Ошибка установки NeoForge: {e.stderr}")

@@ -3,6 +3,14 @@ import os
 import re
 from pathlib import Path
 
+# Скрытие консольных окон дочерних процессов на Windows
+if os.name == "nt":
+    _si = subprocess.STARTUPINFO()
+    _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    NO_WINDOW_KWARGS = {"creationflags": 0x08000000, "startupinfo": _si}
+else:
+    NO_WINDOW_KWARGS = {}
+
 def get_required_java_version(mc_version: str) -> int:
     """Определяет минимальную версию Java для данной версии Minecraft"""
     try:
@@ -50,7 +58,7 @@ def find_java(min_version: int = 8) -> str | None:
         if not os.path.exists(path):
             continue
         try:
-            ver_out = subprocess.check_output([path, "-version"], stderr=subprocess.STDOUT).decode()
+            ver_out = subprocess.check_output([path, "-version"], stderr=subprocess.STDOUT, **NO_WINDOW_KWARGS).decode()
             match = re.search(r'version "?(\d+)', ver_out)
             if match:
                 ver = int(match.group(1))

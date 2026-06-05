@@ -12,6 +12,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Скрытие консольных окон дочерних процессов на Windows
+if os.name == "nt":
+    _si = subprocess.STARTUPINFO()
+    _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    NO_WINDOW_KWARGS = {"creationflags": 0x08000000, "startupinfo": _si}
+else:
+    NO_WINDOW_KWARGS = {}
+
 
 def _download(url: str, dest: Path, log_fn=print):
     req = urllib.request.Request(url)
@@ -174,7 +182,7 @@ def install_neoforge(mc_dir: Path, installer_path: Path, java_exe: str, log_fn=p
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=300,
-                    cwd=str(tmp_dir)
+                    cwd=str(tmp_dir), **NO_WINDOW_KWARGS
                 )
                 if result.returncode != 0:
                     # Show error but continue

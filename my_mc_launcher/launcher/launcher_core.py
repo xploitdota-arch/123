@@ -4,6 +4,14 @@ from pathlib import Path
 from launcher.api import get_version_info
 from launcher.auth import get_offline_uuid
 
+# Скрытие консольных окон дочерних процессов на Windows
+if os.name == "nt":
+    _si = subprocess.STARTUPINFO()
+    _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    NO_WINDOW_KWARGS = {"creationflags": 0x08000000, "startupinfo": _si}
+else:
+    NO_WINDOW_KWARGS = {}
+
 def build_classpath(libs_dir: Path, libraries: list) -> str:
     """Собирает classpath из скачанных библиотек"""
     cp = []
@@ -41,4 +49,4 @@ def launch_minecraft(version_id: str, username: str, java_path: str, mc_dir: Pat
     cmd = [java_path, "-cp", classpath] + jvm_args + ["net.minecraft.client.main.Main"] + game_args
     print(f"🚀 Запуск: {' '.join(cmd)}")
     
-    subprocess.run(cmd)
+    subprocess.run(cmd, **NO_WINDOW_KWARGS)
