@@ -1,5 +1,5 @@
-import uuid
+import hashlib
 
-def get_offline_uuid(username: str) -> str:
-    """Генерирует UUID в формате Minecraft offline"""
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"OfflinePlayer:{username}"))
+def get_offline_uuid(username):
+    hash_obj = hashlib.md5(username.lower().encode())
+    return f"00000000-0000-0000-0000-{hash_obj.hexdigest()[-12:]}"
